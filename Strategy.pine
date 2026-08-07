@@ -1,329 +1,455 @@
 //@version=6
-// XAUUSD Production Strategy
-// Version: 1.0.0
+// XAUUSD Institutional Framework
+// Version: 0.2.0
 //
-// A non-repainting, modular framework for the XAUUSD strategy. Signals and order
-// execution are intentionally introduced only in later milestones; this file is
-// nevertheless a complete, compilable strategy foundation.
+// Session and Opening Range engine. Every state mutation happens on confirmed
+// bars, so the engine never uses future values or repainting calculations.
 
 //============================================================================== 
 // 1. STRATEGY DECLARATION
 //============================================================================== 
-strategy(
-     title                 = "XAUUSD Production Strategy v1.0.0",
-     shorttitle            = "XAUUSD v1.0.0",
-     overlay               = true,
-     pyramiding            = 0,
-     calc_on_every_tick    = false,
-     calc_on_order_fills   = false,
-     process_orders_on_close = true,
-     initial_capital       = 10000,
-     currency              = currency.USD,
-     commission_type       = strategy.commission.percent,
-     commission_value      = 0.0,
-     default_qty_type      = strategy.percent_of_equity,
-     default_qty_value     = 1)
+strategy("XAUUSD Institutional Framework v0.2.0", "XAUUSD v0.2.0", overlay = true,
+     pyramiding = 0, calc_on_every_tick = false, calc_on_order_fills = false,
+     process_orders_on_close = true, initial_capital = 10000, currency = currency.USD,
+     default_qty_type = strategy.percent_of_equity, default_qty_value = 1)
 
 //============================================================================== 
 // 2. CONSTANTS AND ENUMS
 //============================================================================== 
-// Keep user-visible identifiers stable so alerts, templates, and future modules
-// can refer to them without coupling to implementation details.
-string STRATEGY_NAME    = "XAUUSD Production Strategy"
-string STRATEGY_VERSION = "1.0.0"
-string DASHBOARD_TITLE  = "XAUUSD CORE"
-int    MAX_DRAWINGS     = 50
-int    MAX_LOG_ENTRIES  = 25
+string STRATEGY_VERSION = "0.2.0"
+string DASHBOARD_TITLE = "XAUUSD SESSION ENGINE"
+int MILLISECONDS_PER_MINUTE = 60000
+int ATR_LENGTH = 14
 
-enum TradeDirection
-    Flat
-    Long
-    Short
+enum SessionName
+    None
+    Asia
+    London
+    NewYork
+    Custom
 
-enum RiskMode
-    FixedPercent
-    FixedCash
-
-enum LogLevel
-    Debug
-    Info
-    Warning
-    Error
+enum BreakoutState
+    Waiting
+    BuildingRange
+    RangeCompleted
+    BreakoutPending
+    BreakoutConfirmed
+    RetestPending
+    TradeActive
+    SessionFinished
 
 //============================================================================== 
 // 3. INPUTS
 //============================================================================== 
-string GROUP_GENERAL    = "1. General"
-string GROUP_RISK       = "2. Risk"
-string GROUP_SESSION    = "3. Session"
-string GROUP_DASHBOARD  = "4. Dashboard"
-string GROUP_DIAGNOSTICS = "5. Diagnostics"
+string GROUP_GENERAL = "1. General"
+string GROUP_ASIA = "2. Asia Session"
+string GROUP_LONDON = "3. London Session"
+string GROUP_NEW_YORK = "4. New York Session"
+string GROUP_CUSTOM = "5. Custom Session"
+string GROUP_OPENING_RANGE = "6. Opening Range"
+string GROUP_VISUALS = "7. Visuals"
+string GROUP_DASHBOARD = "8. Dashboard and Debug"
 
-bool   enabled          = input.bool(true, "Enable strategy", group = GROUP_GENERAL)
-string tradeSymbol      = input.string("XAUUSD", "Expected symbol", group = GROUP_GENERAL,
-     tooltip = "The chart symbol must contain this text. This prevents accidental use on another market.")
-int    warmupBars       = input.int(200, "Minimum warm-up bars", minval = 1, group = GROUP_GENERAL)
+bool enabled = input.bool(true, "Enable strategy", group = GROUP_GENERAL)
+string expectedSymbol = input.string("XAUUSD", "Expected symbol", group = GROUP_GENERAL)
 
-RiskMode riskMode       = input.enum(RiskMode.FixedPercent, "Risk mode", group = GROUP_RISK)
-float  riskPercent      = input.float(1.0, "Risk per trade (%)", minval = 0.1, maxval = 10.0, step = 0.1, group = GROUP_RISK)
-float  fixedRiskCash    = input.float(100.0, "Fixed risk (USD)", minval = 1.0, step = 1.0, group = GROUP_RISK)
-float  maxDailyLossPct  = input.float(3.0, "Maximum daily loss (%)", minval = 0.1, maxval = 100.0, step = 0.1, group = GROUP_RISK)
+bool asiaEnabled = input.bool(true, "Enable Asia", group = GROUP_ASIA)
+string asiaStart = input.string("0000", "Start (HHMM)", options = ["0000", "0100", "0200", "0300", "0400", "0500", "0600", "0700", "0800", "0900", "1000", "1100", "1200", "1300", "1400", "1500", "1600", "1700", "1800", "1900", "2000", "2100", "2200", "2300"], group = GROUP_ASIA)
+string asiaEnd = input.string("0800", "End (HHMM)", options = ["0000", "0100", "0200", "0300", "0400", "0500", "0600", "0700", "0800", "0900", "1000", "1100", "1200", "1300", "1400", "1500", "1600", "1700", "1800", "1900", "2000", "2100", "2200", "2300"], group = GROUP_ASIA)
+string asiaTimezone = input.string("Etc/UTC", "Timezone", options = ["Etc/UTC", "Asia/Tokyo", "Europe/London", "America/New_York"], group = GROUP_ASIA)
 
-bool   useSessionFilter = input.bool(true, "Use session filter", group = GROUP_SESSION)
-string tradingSession   = input.session("0800-1700", "Trading session", group = GROUP_SESSION)
-string sessionTimezone  = input.string("Etc/UTC", "Session timezone", options = ["Etc/UTC", "America/New_York", "Europe/London", "Asia/Kolkata"], group = GROUP_SESSION)
+bool londonEnabled = input.bool(true, "Enable London", group = GROUP_LONDON)
+string londonStart = input.string("0800", "Start (HHMM)", options = ["0000", "0100", "0200", "0300", "0400", "0500", "0600", "0700", "0800", "0900", "1000", "1100", "1200", "1300", "1400", "1500", "1600", "1700", "1800", "1900", "2000", "2100", "2200", "2300"], group = GROUP_LONDON)
+string londonEnd = input.string("1600", "End (HHMM)", options = ["0000", "0100", "0200", "0300", "0400", "0500", "0600", "0700", "0800", "0900", "1000", "1100", "1200", "1300", "1400", "1500", "1600", "1700", "1800", "1900", "2000", "2100", "2200", "2300"], group = GROUP_LONDON)
+string londonTimezone = input.string("Europe/London", "Timezone", options = ["Etc/UTC", "Asia/Tokyo", "Europe/London", "America/New_York"], group = GROUP_LONDON)
 
-bool   showDashboard    = input.bool(true, "Show dashboard", group = GROUP_DASHBOARD)
-string dashboardPosition = input.string("Top Right", "Dashboard position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = GROUP_DASHBOARD)
-bool   showStatusLabel  = input.bool(true, "Show status label", group = GROUP_DASHBOARD)
+bool newYorkEnabled = input.bool(true, "Enable New York", group = GROUP_NEW_YORK)
+string newYorkStart = input.string("0800", "Start (HHMM)", options = ["0000", "0100", "0200", "0300", "0400", "0500", "0600", "0700", "0800", "0900", "1000", "1100", "1200", "1300", "1400", "1500", "1600", "1700", "1800", "1900", "2000", "2100", "2200", "2300"], group = GROUP_NEW_YORK)
+string newYorkEnd = input.string("1700", "End (HHMM)", options = ["0000", "0100", "0200", "0300", "0400", "0500", "0600", "0700", "0800", "0900", "1000", "1100", "1200", "1300", "1400", "1500", "1600", "1700", "1800", "1900", "2000", "2100", "2200", "2300"], group = GROUP_NEW_YORK)
+string newYorkTimezone = input.string("America/New_York", "Timezone", options = ["Etc/UTC", "Asia/Tokyo", "Europe/London", "America/New_York"], group = GROUP_NEW_YORK)
 
-bool   enableLogging    = input.bool(false, "Enable Pine Logs", group = GROUP_DIAGNOSTICS,
-     tooltip = "Useful while developing. Disable for normal chart use.")
-bool   showValidation   = input.bool(true, "Show validation messages", group = GROUP_DIAGNOSTICS)
+bool customEnabled = input.bool(false, "Enable Custom", group = GROUP_CUSTOM)
+string customStart = input.string("0800", "Start (HHMM)", options = ["0000", "0100", "0200", "0300", "0400", "0500", "0600", "0700", "0800", "0900", "1000", "1100", "1200", "1300", "1400", "1500", "1600", "1700", "1800", "1900", "2000", "2100", "2200", "2300"], group = GROUP_CUSTOM)
+string customEnd = input.string("1700", "End (HHMM)", options = ["0000", "0100", "0200", "0300", "0400", "0500", "0600", "0700", "0800", "0900", "1000", "1100", "1200", "1300", "1400", "1500", "1600", "1700", "1800", "1900", "2000", "2100", "2200", "2300"], group = GROUP_CUSTOM)
+string customTimezone = input.string("Etc/UTC", "Timezone", options = ["Etc/UTC", "Asia/Tokyo", "Europe/London", "America/New_York"], group = GROUP_CUSTOM)
+
+string openingRangeLength = input.string("30", "Opening range length (minutes)", options = ["15", "30", "45", "60", "90", "120"], group = GROUP_OPENING_RANGE)
+float minimumAtrRatio = input.float(0.25, "Minimum ATR ratio", minval = 0.01, step = 0.01, group = GROUP_OPENING_RANGE)
+float maximumAtrRatio = input.float(2.50, "Maximum ATR ratio", minval = 0.02, step = 0.01, group = GROUP_OPENING_RANGE)
+
+bool showRangeBox = input.bool(true, "Draw opening range box", group = GROUP_VISUALS)
+color rangeColor = input.color(color.aqua, "Range color", group = GROUP_VISUALS)
+int rangeTransparency = input.int(85, "Range transparency", minval = 0, maxval = 100, group = GROUP_VISUALS)
+bool showRangeBorder = input.bool(true, "Draw range border", group = GROUP_VISUALS)
+bool showRangeLines = input.bool(true, "Draw high, low, and mid", group = GROUP_VISUALS)
+bool showRangeLabels = input.bool(true, "Draw range labels", group = GROUP_VISUALS)
+
+bool showDashboard = input.bool(true, "Show dashboard", group = GROUP_DASHBOARD)
+bool debugEnabled = input.bool(false, "Show debug panel", group = GROUP_DASHBOARD)
 
 //============================================================================== 
-// 4. DATA MODELS AND STATE
+// 4. STATE MODELS
 //============================================================================== 
-type TradeState
-    TradeDirection direction
-    float entryPrice
-    float stopPrice
-    float targetPrice
-    float quantity
-    int entryBarIndex
-    int closedTradesAtEntry
-
-type SessionState
+type SessionEngineState
+    SessionName currentSession
     bool isActive
-    bool wasActive
-    bool justOpened
-    bool justClosed
-    int sessionStartBar
-    int sessionTradeCount
+    bool justStarted
+    bool justEnded
+    int startTime
+    int durationMinutes
+    int barsInSession
+    float progressPercent
+    int barsRemaining
 
-type StatisticsState
-    int totalTrades
-    int winningTrades
-    int losingTrades
-    float grossProfit
-    float grossLoss
-    float netProfit
-    float peakEquity
-    float dayStartEquity
-    int trackedDay
+type OpeningRangeState
+    float high
+    float low
+    float mid
+    float width
+    float atrRatio
+    float percent
+    float ticks
+    int startTime
+    int endTime
+    int bars
+    bool isBuilding
+    bool isComplete
+    bool qualityAccepted
 
-type ConfigurationState
-    bool isValid
-    string message
-    bool symbolMatches
-    bool hasWarmup
+type TradeControlState
+    bool tradeTaken
+    bool longTaken
+    bool shortTaken
+    bool sessionLocked
 
-var TradeState tradeState = TradeState.new(TradeDirection.Flat, na, na, na, na, na, 0)
-var SessionState sessionState = SessionState.new(false, false, false, false, na, 0)
-var StatisticsState statisticsState = StatisticsState.new(0, 0, 0, 0.0, 0.0, 0.0, strategy.initial_capital, strategy.initial_capital, na)
-var ConfigurationState configurationState = ConfigurationState.new(false, "Initializing", false, false)
+type SessionStatistics
+    int sessions
+    float totalRange
+    float largestRange
+    float smallestRange
+    float totalAtrRatio
+    int breakouts
+    int falseBreakouts
+    int successfulBreakouts
+
+var SessionEngineState sessionState = SessionEngineState.new(SessionName.None, false, false, false, na, 0, 0, 0.0, 0)
+var OpeningRangeState rangeState = OpeningRangeState.new(na, na, na, na, na, na, na, na, na, 0, false, false, false)
+var TradeControlState tradeControl = TradeControlState.new(false, false, false, false)
+var SessionStatistics sessionStatistics = SessionStatistics.new(0, 0.0, na, na, 0.0, 0, 0, 0)
+var BreakoutState breakoutState = BreakoutState.Waiting
+var int breakoutDirection = 0
+var float atrAtRangeCompletion = na
 
 //============================================================================== 
 // 5. UTILITY FUNCTIONS
 //============================================================================== 
-f_clamp(float value, float minimum, float maximum) =>
-    math.max(minimum, math.min(value, maximum))
+// Returns a TradingView session specification from two HHMM input values.
+BuildSession(string startValue, string endValue) =>
+    startValue + "-" + endValue
 
-f_roundToTick(float price) =>
-    math.round(price / syminfo.mintick) * syminfo.mintick
+// Returns true when the current chart bar belongs to the supplied session.
+IsInSession(string sessionSpec, string timezone) =>
+    not na(time(timeframe.period, sessionSpec, timezone))
 
-f_percentOf(float value, float percentage) =>
-    value * percentage * 0.01
+// Returns a readable name for a session enum value.
+SessionText(SessionName sessionName) =>
+    switch sessionName
+        SessionName.Asia => "Asia"
+        SessionName.London => "London"
+        SessionName.NewYork => "New York"
+        SessionName.Custom => "Custom"
+        => "None"
 
-f_safeDivide(float numerator, float denominator, float fallback = 0.0) =>
+// Returns a readable name for a breakout-state enum value.
+StateText(BreakoutState state) =>
+    switch state
+        BreakoutState.Waiting => "Waiting"
+        BreakoutState.BuildingRange => "Building Range"
+        BreakoutState.RangeCompleted => "Range Completed"
+        BreakoutState.BreakoutPending => "Breakout Pending"
+        BreakoutState.BreakoutConfirmed => "Breakout Confirmed"
+        BreakoutState.RetestPending => "Retest Pending"
+        BreakoutState.TradeActive => "Trade Active"
+        => "Session Finished"
+
+// Prevents division-by-zero while preserving a caller supplied fallback value.
+SafeDivide(float numerator, float denominator, float fallback) =>
     denominator != 0.0 ? numerator / denominator : fallback
 
-f_formatPrice(float price) =>
-    na(price) ? "—" : str.tostring(price, format.mintick)
+// Formats a price using the chart symbol's minimum tick size.
+FormatPrice(float price) =>
+    na(price) ? "n/a" : str.tostring(price, format.mintick)
 
-f_formatPercent(float value) =>
-    na(value) ? "—" : str.tostring(value, "#.##") + "%"
+// Formats a decimal number as a concise percentage string.
+FormatPercent(float value) =>
+    na(value) ? "n/a" : str.tostring(value, "#.##") + "%"
 
-f_directionText(TradeDirection direction) =>
-    switch direction
-        TradeDirection.Long  => "LONG"
-        TradeDirection.Short => "SHORT"
-        => "FLAT"
+// Converts the opening-range input selection into an integer minute duration.
+OpeningRangeMinutes() =>
+    int(str.tonumber(openingRangeLength))
 
-f_dashboardPosition(string selection) =>
-    switch selection
-        "Top Left"     => position.top_left
-        "Bottom Right" => position.bottom_right
-        "Bottom Left"  => position.bottom_left
-        => position.top_right
+// Converts a HHMM session input into minutes since midnight.
+MinutesFromHhmm(string timeValue) =>
+    int hours = int(str.tonumber(str.substring(timeValue, 0, 2)))
+    int minutes = int(str.tonumber(str.substring(timeValue, 2, 4)))
+    hours * 60 + minutes
 
-//============================================================================== 
-// 6. LOGGING
-//============================================================================== 
-f_log(LogLevel level, string message) =>
-    if enableLogging and barstate.isconfirmed
-        string prefix = switch level
-            LogLevel.Debug   => "DEBUG"
-            LogLevel.Info    => "INFO"
-            LogLevel.Warning => "WARN"
-            => "ERROR"
-        string event = "[" + STRATEGY_VERSION + "][" + prefix + "] " + message
-        switch level
-            LogLevel.Error   => log.error(event)
-            LogLevel.Warning => log.warning(event)
-            LogLevel.Info    => log.info(event)
-            => log.info(event)
+// Returns the configured duration for one session, including midnight crossings.
+SessionDurationMinutes(SessionName sessionName) =>
+    string startValue = sessionName == SessionName.Asia ? asiaStart : sessionName == SessionName.London ? londonStart : sessionName == SessionName.NewYork ? newYorkStart : customStart
+    string endValue = sessionName == SessionName.Asia ? asiaEnd : sessionName == SessionName.London ? londonEnd : sessionName == SessionName.NewYork ? newYorkEnd : customEnd
+    int startMinutes = MinutesFromHhmm(startValue)
+    int endMinutes = MinutesFromHhmm(endValue)
+    int rawDuration = endMinutes - startMinutes
+    rawDuration > 0 ? rawDuration : rawDuration + 1440
 
-//============================================================================== 
-// 7. CONFIGURATION AND VALIDATION
-//============================================================================== 
-f_symbolMatches() =>
-    str.contains(str.upper(syminfo.tickerid), str.upper(tradeSymbol))
-
-f_hasWarmup() =>
-    bar_index >= warmupBars
-
-f_validateConfiguration() =>
-    bool validSymbol = f_symbolMatches()
-    bool validWarmup = f_hasWarmup()
-    bool validRisk = riskMode == RiskMode.FixedPercent ? riskPercent > 0.0 : fixedRiskCash > 0.0
-    bool validSession = not useSessionFilter or str.length(tradingSession) > 0
-    bool valid = enabled and validSymbol and validRisk and validSession
-    string message = not enabled ? "Strategy disabled" : not validSymbol ? "Chart symbol does not match expected symbol" : not validRisk ? "Risk configuration is invalid" : not validSession ? "Session configuration is invalid" : not validWarmup ? "Waiting for warm-up bars" : "Ready"
-    ConfigurationState.new(valid, message, validSymbol, validWarmup)
+// Selects one current session with stable priority: Asia, London, New York, Custom.
+CurrentSession() =>
+    bool asiaActive = asiaEnabled and IsInSession(BuildSession(asiaStart, asiaEnd), asiaTimezone)
+    bool londonActive = londonEnabled and IsInSession(BuildSession(londonStart, londonEnd), londonTimezone)
+    bool newYorkActive = newYorkEnabled and IsInSession(BuildSession(newYorkStart, newYorkEnd), newYorkTimezone)
+    bool customActive = customEnabled and IsInSession(BuildSession(customStart, customEnd), customTimezone)
+    asiaActive ? SessionName.Asia : londonActive ? SessionName.London : newYorkActive ? SessionName.NewYork : customActive ? SessionName.Custom : SessionName.None
 
 //============================================================================== 
-// 8. SESSION MANAGER
+// 6. SESSION ENGINE
 //============================================================================== 
-f_updateSessionState() =>
-    bool activeNow = not useSessionFilter or not na(time(timeframe.period, tradingSession, sessionTimezone))
-    bool openedNow = activeNow and not sessionState.isActive
-    bool closedNow = not activeNow and sessionState.isActive
-    sessionState.wasActive := sessionState.isActive
+// Updates session lifecycle fields once per confirmed bar.
+UpdateSessionEngine() =>
+    SessionName activeSession = CurrentSession()
+    bool activeNow = activeSession != SessionName.None
+    bool sessionChanged = activeNow and activeSession != sessionState.currentSession
+    sessionState.justStarted := sessionChanged
+    sessionState.justEnded := sessionState.isActive and (not activeNow or sessionChanged)
+    if sessionChanged
+        sessionState.currentSession := activeSession
+        sessionState.startTime := time
+        sessionState.durationMinutes := SessionDurationMinutes(activeSession)
+        sessionState.barsInSession := 1
+    else if activeNow
+        sessionState.barsInSession += 1
+    else
+        sessionState.barsInSession := 0
+        sessionState.currentSession := SessionName.None
+        sessionState.durationMinutes := 0
     sessionState.isActive := activeNow
-    sessionState.justOpened := openedNow
-    sessionState.justClosed := closedNow
-    if openedNow
-        sessionState.sessionStartBar := bar_index
-        sessionState.sessionTradeCount := 0
-        f_log(LogLevel.Info, "Trading session opened")
-    if closedNow
-        f_log(LogLevel.Info, "Trading session closed")
+    float elapsedMilliseconds = activeNow ? time - sessionState.startTime : 0.0
+    float durationMilliseconds = sessionState.durationMinutes * MILLISECONDS_PER_MINUTE
+    sessionState.progressPercent := activeNow ? math.min(100.0, SafeDivide(elapsedMilliseconds * 100.0, durationMilliseconds, 0.0)) : 0.0
+    float barMilliseconds = timeframe.in_seconds() * 1000.0
+    sessionState.barsRemaining := activeNow ? math.max(0, int(math.ceil(SafeDivide(durationMilliseconds - elapsedMilliseconds, barMilliseconds, 0.0))) ) : 0
 
 //============================================================================== 
-// 9. TRADE STATE MANAGER
+// 7. OPENING RANGE ENGINE
 //============================================================================== 
-f_syncTradeState() =>
-    float positionSize = strategy.position_size
-    TradeDirection liveDirection = positionSize > 0 ? TradeDirection.Long : positionSize < 0 ? TradeDirection.Short : TradeDirection.Flat
-    if liveDirection != tradeState.direction
-        tradeState.direction := liveDirection
-        tradeState.entryPrice := liveDirection == TradeDirection.Flat ? na : strategy.position_avg_price
-        tradeState.entryBarIndex := liveDirection == TradeDirection.Flat ? na : bar_index
-        if liveDirection == TradeDirection.Flat
-            tradeState.stopPrice := na
-            tradeState.targetPrice := na
-            tradeState.quantity := na
-        else
-            tradeState.quantity := math.abs(positionSize)
-        f_log(LogLevel.Info, "Trade state changed to " + f_directionText(liveDirection))
+// Resets every range and trade-control field at the beginning of a new session.
+ResetForSession() =>
+    rangeState.high := na
+    rangeState.low := na
+    rangeState.mid := na
+    rangeState.width := na
+    rangeState.atrRatio := na
+    rangeState.percent := na
+    rangeState.ticks := na
+    rangeState.startTime := time
+    rangeState.endTime := time + OpeningRangeMinutes() * MILLISECONDS_PER_MINUTE
+    rangeState.bars := 0
+    rangeState.isBuilding := true
+    rangeState.isComplete := false
+    rangeState.qualityAccepted := false
+    tradeControl.tradeTaken := false
+    tradeControl.longTaken := false
+    tradeControl.shortTaken := false
+    tradeControl.sessionLocked := false
+    breakoutDirection := 0
+    atrAtRangeCompletion := na
+    breakoutState := BreakoutState.BuildingRange
 
-//============================================================================== 
-// 10. STATISTICS MANAGER
-//============================================================================== 
-f_updateStatistics() =>
-    int currentDay = dayofmonth(time)
-    if na(statisticsState.trackedDay) or currentDay != statisticsState.trackedDay
-        statisticsState.trackedDay := currentDay
-        statisticsState.dayStartEquity := strategy.equity
-    statisticsState.totalTrades := strategy.closedtrades
-    statisticsState.winningTrades := strategy.wintrades
-    statisticsState.losingTrades := strategy.losstrades
-    statisticsState.grossProfit := strategy.grossprofit
-    statisticsState.grossLoss := strategy.grossloss
-    statisticsState.netProfit := strategy.netprofit
-    statisticsState.peakEquity := math.max(statisticsState.peakEquity, strategy.equity)
+// Adds one confirmed bar to the opening range and derives its metrics.
+BuildOpeningRange(float atrValue) =>
+    bool isRangeBar = time < rangeState.endTime
+    if rangeState.isBuilding and isRangeBar
+        rangeState.high := na(rangeState.high) ? high : math.max(rangeState.high, high)
+        rangeState.low := na(rangeState.low) ? low : math.min(rangeState.low, low)
+        rangeState.bars += 1
+        rangeState.mid := (rangeState.high + rangeState.low) * 0.5
+        rangeState.width := rangeState.high - rangeState.low
+        rangeState.atrRatio := SafeDivide(rangeState.width, atrValue, na)
+        rangeState.percent := SafeDivide(rangeState.width * 100.0, rangeState.mid, na)
+        rangeState.ticks := SafeDivide(rangeState.width, syminfo.mintick, na)
+    if rangeState.isBuilding and not isRangeBar
+        rangeState.isBuilding := false
+        rangeState.isComplete := true
+        rangeState.mid := (rangeState.high + rangeState.low) * 0.5
+        rangeState.width := rangeState.high - rangeState.low
+        atrAtRangeCompletion := atrValue
+        rangeState.atrRatio := SafeDivide(rangeState.width, atrValue, na)
+        rangeState.percent := SafeDivide(rangeState.width * 100.0, rangeState.mid, na)
+        rangeState.ticks := SafeDivide(rangeState.width, syminfo.mintick, na)
+        rangeState.qualityAccepted := rangeState.atrRatio >= minimumAtrRatio and rangeState.atrRatio <= maximumAtrRatio
+        breakoutState := BreakoutState.RangeCompleted
 
-f_winRate() =>
-    f_safeDivide(statisticsState.winningTrades * 100.0, statisticsState.totalTrades)
-
-f_dailyLossPercent() =>
-    f_safeDivide(math.max(0.0, statisticsState.dayStartEquity - strategy.equity) * 100.0, statisticsState.dayStartEquity)
-
-//============================================================================== 
-// 11. DRAWING MANAGER
-//============================================================================== 
-var array<label> managedLabels = array.new_label()
-var label statusLabel = na
-
-f_trimLabels() =>
-    while array.size(managedLabels) > MAX_DRAWINGS
-        label.delete(array.shift(managedLabels))
-
-f_drawStatusLabel() =>
-    if showStatusLabel and barstate.islast
-        string status = configurationState.isValid and configurationState.hasWarmup ? "READY" : configurationState.message
-        color statusColor = configurationState.isValid and configurationState.hasWarmup ? color.green : color.orange
-        if na(statusLabel)
-            statusLabel := label.new(bar_index, high, status, style = label.style_label_down, textcolor = color.white, color = statusColor, size = size.small)
-            array.push(managedLabels, statusLabel)
-        else
-            label.set_xy(statusLabel, bar_index, high)
-            label.set_text(statusLabel, status)
-            label.set_color(statusLabel, statusColor)
-        f_trimLabels()
-    else if not na(statusLabel)
-        label.delete(statusLabel)
-        statusLabel := na
+// Stores a completed range in aggregate session statistics exactly once.
+RecordCompletedRange() =>
+    sessionStatistics.sessions += 1
+    sessionStatistics.totalRange += rangeState.width
+    sessionStatistics.totalAtrRatio += rangeState.atrRatio
+    sessionStatistics.largestRange := na(sessionStatistics.largestRange) ? rangeState.width : math.max(sessionStatistics.largestRange, rangeState.width)
+    sessionStatistics.smallestRange := na(sessionStatistics.smallestRange) ? rangeState.width : math.min(sessionStatistics.smallestRange, rangeState.width)
 
 //============================================================================== 
-// 12. DASHBOARD FRAMEWORK
+// 8. BREAKOUT STATE MACHINE
 //============================================================================== 
-var table dashboard = table.new(f_dashboardPosition(dashboardPosition), 2, 8, border_width = 1)
+// Advances the non-trading breakout state machine using only confirmed closes.
+UpdateBreakoutState() =>
+    if rangeState.isComplete and sessionState.isActive and rangeState.qualityAccepted
+        bool closesAbove = close > rangeState.high
+        bool closesBelow = close < rangeState.low
+        bool closesInside = close <= rangeState.high and close >= rangeState.low
+        if breakoutState == BreakoutState.RangeCompleted and (closesAbove or closesBelow)
+            breakoutDirection := closesAbove ? 1 : -1
+            breakoutState := BreakoutState.BreakoutPending
+        else if breakoutState == BreakoutState.BreakoutPending
+            bool confirms = breakoutDirection == 1 ? closesAbove : closesBelow
+            if confirms
+                breakoutState := BreakoutState.BreakoutConfirmed
+                sessionStatistics.breakouts += 1
+                sessionStatistics.successfulBreakouts += 1
+            else if closesInside
+                breakoutState := BreakoutState.RangeCompleted
+                breakoutDirection := 0
+                sessionStatistics.falseBreakouts += 1
+        else if breakoutState == BreakoutState.BreakoutConfirmed
+            bool retestsLevel = breakoutDirection == 1 ? low <= rangeState.high : high >= rangeState.low
+            if retestsLevel
+                breakoutState := BreakoutState.RetestPending
+        else if breakoutState == BreakoutState.RetestPending
+            bool resumesBreakout = breakoutDirection == 1 ? close > rangeState.high : close < rangeState.low
+            if resumesBreakout
+                breakoutState := BreakoutState.BreakoutConfirmed
 
-f_dashboardCell(int column, int row, string text, color background, color foreground = color.white) =>
-    table.cell(dashboard, column, row, text, text_color = foreground, bgcolor = background, text_size = size.small)
+//============================================================================== 
+// 9. DRAWING MANAGER
+//============================================================================== 
+var box rangeBox = na
+var line rangeHighLine = na
+var line rangeLowLine = na
+var line rangeMidLine = na
+var label rangeHighLabel = na
+var label rangeLowLabel = na
+var label rangeWidthLabel = na
 
-f_updateDashboard() =>
+// Creates the fixed set of drawing objects once, then updates them in place.
+EnsureDrawings() =>
+    if na(rangeBox)
+        rangeBox := box.new(bar_index, close, bar_index, close, border_color = rangeColor, bgcolor = color.new(rangeColor, rangeTransparency))
+        rangeHighLine := line.new(bar_index, close, bar_index, close, color = rangeColor)
+        rangeLowLine := line.new(bar_index, close, bar_index, close, color = rangeColor)
+        rangeMidLine := line.new(bar_index, close, bar_index, close, color = color.new(rangeColor, 30), style = line.style_dashed)
+        rangeHighLabel := label.new(bar_index, close, "", style = label.style_label_left, color = color.new(rangeColor, 80), textcolor = color.white, size = size.tiny)
+        rangeLowLabel := label.new(bar_index, close, "", style = label.style_label_left, color = color.new(rangeColor, 80), textcolor = color.white, size = size.tiny)
+        rangeWidthLabel := label.new(bar_index, close, "", style = label.style_label_left, color = color.new(rangeColor, 80), textcolor = color.white, size = size.tiny)
+
+// Shows the latest opening range using reused box, line, and label objects.
+UpdateRangeDrawings() =>
+    EnsureDrawings()
+    bool hasRange = not na(rangeState.high) and not na(rangeState.low)
+    int leftBar = math.max(0, bar_index - rangeState.bars + 1)
+    if hasRange and showRangeBox
+        box.set_lefttop(rangeBox, leftBar, rangeState.high)
+        box.set_rightbottom(rangeBox, bar_index, rangeState.low)
+        box.set_bgcolor(rangeBox, color.new(rangeColor, rangeTransparency))
+        box.set_border_color(rangeBox, showRangeBorder ? rangeColor : color.new(rangeColor, 100))
+    else
+        box.set_bgcolor(rangeBox, color.new(rangeColor, 100))
+        box.set_border_color(rangeBox, color.new(rangeColor, 100))
+    if hasRange and showRangeLines
+        line.set_xy1(rangeHighLine, leftBar, rangeState.high)
+        line.set_xy2(rangeHighLine, bar_index, rangeState.high)
+        line.set_xy1(rangeLowLine, leftBar, rangeState.low)
+        line.set_xy2(rangeLowLine, bar_index, rangeState.low)
+        line.set_xy1(rangeMidLine, leftBar, rangeState.mid)
+        line.set_xy2(rangeMidLine, bar_index, rangeState.mid)
+        line.set_color(rangeHighLine, rangeColor)
+        line.set_color(rangeLowLine, rangeColor)
+        line.set_color(rangeMidLine, color.new(rangeColor, 30))
+    else
+        line.set_color(rangeHighLine, color.new(rangeColor, 100))
+        line.set_color(rangeLowLine, color.new(rangeColor, 100))
+        line.set_color(rangeMidLine, color.new(rangeColor, 100))
+    if hasRange and showRangeLabels
+        label.set_xy(rangeHighLabel, bar_index, rangeState.high)
+        label.set_text(rangeHighLabel, "OR High " + FormatPrice(rangeState.high))
+        label.set_xy(rangeLowLabel, bar_index, rangeState.low)
+        label.set_text(rangeLowLabel, "OR Low " + FormatPrice(rangeState.low))
+        label.set_xy(rangeWidthLabel, bar_index, rangeState.mid)
+        label.set_text(rangeWidthLabel, "Width " + FormatPrice(rangeState.width))
+        label.set_color(rangeHighLabel, color.new(rangeColor, 80))
+        label.set_color(rangeLowLabel, color.new(rangeColor, 80))
+        label.set_color(rangeWidthLabel, color.new(rangeColor, 80))
+    else
+        label.set_color(rangeHighLabel, color.new(rangeColor, 100))
+        label.set_color(rangeLowLabel, color.new(rangeColor, 100))
+        label.set_color(rangeWidthLabel, color.new(rangeColor, 100))
+
+//============================================================================== 
+// 10. DASHBOARD AND DEBUG
+//============================================================================== 
+var table dashboard = table.new(position.top_right, 2, 8, border_width = 1)
+var table debugTable = table.new(position.bottom_right, 2, 6, border_width = 1)
+
+// Writes one consistently styled dashboard row.
+SetDashboardRow(table target, int row, string caption, string value) =>
+    table.cell(target, 0, row, caption, text_color = color.silver, bgcolor = color.new(color.black, 15), text_size = size.small)
+    table.cell(target, 1, row, value, text_color = color.white, bgcolor = color.new(color.black, 65), text_size = size.small)
+
+// Updates the session dashboard only on the last chart bar.
+UpdateDashboard() =>
     if barstate.islast
         if showDashboard
-            color headerColor = color.new(color.blue, 15)
-            color labelColor = color.new(color.black, 15)
-            color valueColor = color.new(color.black, 55)
-            color statusColor = configurationState.isValid and configurationState.hasWarmup ? color.new(color.green, 30) : color.new(color.orange, 30)
-            f_dashboardCell(0, 0, DASHBOARD_TITLE + " v" + STRATEGY_VERSION, headerColor)
-            f_dashboardCell(1, 0, configurationState.message, statusColor)
-            f_dashboardCell(0, 1, "Symbol", labelColor)
-            f_dashboardCell(1, 1, syminfo.ticker, valueColor)
-            f_dashboardCell(0, 2, "Session", labelColor)
-            f_dashboardCell(1, 2, sessionState.isActive ? "ACTIVE" : "CLOSED", valueColor)
-            f_dashboardCell(0, 3, "Position", labelColor)
-            f_dashboardCell(1, 3, f_directionText(tradeState.direction), valueColor)
-            f_dashboardCell(0, 4, "Closed trades", labelColor)
-            f_dashboardCell(1, 4, str.tostring(statisticsState.totalTrades), valueColor)
-            f_dashboardCell(0, 5, "Win rate", labelColor)
-            f_dashboardCell(1, 5, f_formatPercent(f_winRate()), valueColor)
-            f_dashboardCell(0, 6, "Net profit", labelColor)
-            f_dashboardCell(1, 6, str.tostring(statisticsState.netProfit, "#.##"), valueColor)
-            f_dashboardCell(0, 7, "Daily loss", labelColor)
-            f_dashboardCell(1, 7, f_formatPercent(f_dailyLossPercent()), valueColor)
+            SetDashboardRow(dashboard, 0, DASHBOARD_TITLE, "v" + STRATEGY_VERSION)
+            SetDashboardRow(dashboard, 1, "Current session", SessionText(sessionState.currentSession))
+            SetDashboardRow(dashboard, 2, "Current state", StateText(breakoutState))
+            SetDashboardRow(dashboard, 3, "Range width", FormatPrice(rangeState.width))
+            SetDashboardRow(dashboard, 4, "ATR ratio", str.tostring(rangeState.atrRatio, "#.##"))
+            SetDashboardRow(dashboard, 5, "Session progress", FormatPercent(sessionState.progressPercent))
+            SetDashboardRow(dashboard, 6, "Bars in session", str.tostring(sessionState.barsInSession))
+            SetDashboardRow(dashboard, 7, "Bars remaining", str.tostring(sessionState.barsRemaining))
         else
             table.clear(dashboard, 0, 0, 1, 7)
 
+// Updates the diagnostic panel only on the last chart bar when debugging is enabled.
+UpdateDebugPanel() =>
+    if barstate.islast
+        if debugEnabled
+            SetDashboardRow(debugTable, 0, "DEBUG", "v" + STRATEGY_VERSION)
+            SetDashboardRow(debugTable, 1, "Session", SessionText(sessionState.currentSession))
+            SetDashboardRow(debugTable, 2, "State", StateText(breakoutState))
+            SetDashboardRow(debugTable, 3, "Range high", FormatPrice(rangeState.high))
+            SetDashboardRow(debugTable, 4, "Range low", FormatPrice(rangeState.low))
+            SetDashboardRow(debugTable, 5, "ATR / bars", str.tostring(rangeState.atrRatio, "#.##") + " / " + str.tostring(sessionState.barsInSession))
+        else
+            table.clear(debugTable, 0, 0, 1, 5)
+
 //============================================================================== 
-// 13. CORE ORCHESTRATION
+// 11. ORCHESTRATION
 //============================================================================== 
-// All state changes happen only on confirmed bars. This is the framework-level
-// non-repainting guarantee that later signal modules must preserve.
+float atrValue = ta.atr(ATR_LENGTH)
+bool symbolMatches = str.contains(str.upper(syminfo.tickerid), str.upper(expectedSymbol))
+
 if barstate.isconfirmed
-    configurationState := f_validateConfiguration()
-    f_updateSessionState()
-    f_syncTradeState()
-    f_updateStatistics()
+    UpdateSessionEngine()
+    if sessionState.justEnded
+        if rangeState.isComplete
+            RecordCompletedRange()
+        tradeControl.sessionLocked := true
+        breakoutState := BreakoutState.SessionFinished
+    if enabled and symbolMatches and sessionState.justStarted
+        ResetForSession()
+    if enabled and symbolMatches and sessionState.isActive
+        BuildOpeningRange(atrValue)
+        UpdateBreakoutState()
 
-    if showValidation and not configurationState.isValid
-        f_log(LogLevel.Warning, configurationState.message)
-
-f_drawStatusLabel()
-f_updateDashboard()
-
+UpdateRangeDrawings()
+UpdateDashboard()
+UpdateDebugPanel()
