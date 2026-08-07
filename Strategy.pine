@@ -1,0 +1,329 @@
+//@version=6
+// XAUUSD Production Strategy
+// Version: 1.0.0
+//
+// A non-repainting, modular framework for the XAUUSD strategy. Signals and order
+// execution are intentionally introduced only in later milestones; this file is
+// nevertheless a complete, compilable strategy foundation.
+
+//============================================================================== 
+// 1. STRATEGY DECLARATION
+//============================================================================== 
+strategy(
+     title                 = "XAUUSD Production Strategy v1.0.0",
+     shorttitle            = "XAUUSD v1.0.0",
+     overlay               = true,
+     pyramiding            = 0,
+     calc_on_every_tick    = false,
+     calc_on_order_fills   = false,
+     process_orders_on_close = true,
+     initial_capital       = 10000,
+     currency              = currency.USD,
+     commission_type       = strategy.commission.percent,
+     commission_value      = 0.0,
+     default_qty_type      = strategy.percent_of_equity,
+     default_qty_value     = 1)
+
+//============================================================================== 
+// 2. CONSTANTS AND ENUMS
+//============================================================================== 
+// Keep user-visible identifiers stable so alerts, templates, and future modules
+// can refer to them without coupling to implementation details.
+string STRATEGY_NAME    = "XAUUSD Production Strategy"
+string STRATEGY_VERSION = "1.0.0"
+string DASHBOARD_TITLE  = "XAUUSD CORE"
+int    MAX_DRAWINGS     = 50
+int    MAX_LOG_ENTRIES  = 25
+
+enum TradeDirection
+    Flat
+    Long
+    Short
+
+enum RiskMode
+    FixedPercent
+    FixedCash
+
+enum LogLevel
+    Debug
+    Info
+    Warning
+    Error
+
+//============================================================================== 
+// 3. INPUTS
+//============================================================================== 
+string GROUP_GENERAL    = "1. General"
+string GROUP_RISK       = "2. Risk"
+string GROUP_SESSION    = "3. Session"
+string GROUP_DASHBOARD  = "4. Dashboard"
+string GROUP_DIAGNOSTICS = "5. Diagnostics"
+
+bool   enabled          = input.bool(true, "Enable strategy", group = GROUP_GENERAL)
+string tradeSymbol      = input.string("XAUUSD", "Expected symbol", group = GROUP_GENERAL,
+     tooltip = "The chart symbol must contain this text. This prevents accidental use on another market.")
+int    warmupBars       = input.int(200, "Minimum warm-up bars", minval = 1, group = GROUP_GENERAL)
+
+RiskMode riskMode       = input.enum(RiskMode.FixedPercent, "Risk mode", group = GROUP_RISK)
+float  riskPercent      = input.float(1.0, "Risk per trade (%)", minval = 0.1, maxval = 10.0, step = 0.1, group = GROUP_RISK)
+float  fixedRiskCash    = input.float(100.0, "Fixed risk (USD)", minval = 1.0, step = 1.0, group = GROUP_RISK)
+float  maxDailyLossPct  = input.float(3.0, "Maximum daily loss (%)", minval = 0.1, maxval = 100.0, step = 0.1, group = GROUP_RISK)
+
+bool   useSessionFilter = input.bool(true, "Use session filter", group = GROUP_SESSION)
+string tradingSession   = input.session("0800-1700", "Trading session", group = GROUP_SESSION)
+string sessionTimezone  = input.string("Etc/UTC", "Session timezone", options = ["Etc/UTC", "America/New_York", "Europe/London", "Asia/Kolkata"], group = GROUP_SESSION)
+
+bool   showDashboard    = input.bool(true, "Show dashboard", group = GROUP_DASHBOARD)
+string dashboardPosition = input.string("Top Right", "Dashboard position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = GROUP_DASHBOARD)
+bool   showStatusLabel  = input.bool(true, "Show status label", group = GROUP_DASHBOARD)
+
+bool   enableLogging    = input.bool(false, "Enable Pine Logs", group = GROUP_DIAGNOSTICS,
+     tooltip = "Useful while developing. Disable for normal chart use.")
+bool   showValidation   = input.bool(true, "Show validation messages", group = GROUP_DIAGNOSTICS)
+
+//============================================================================== 
+// 4. DATA MODELS AND STATE
+//============================================================================== 
+type TradeState
+    TradeDirection direction
+    float entryPrice
+    float stopPrice
+    float targetPrice
+    float quantity
+    int entryBarIndex
+    int closedTradesAtEntry
+
+type SessionState
+    bool isActive
+    bool wasActive
+    bool justOpened
+    bool justClosed
+    int sessionStartBar
+    int sessionTradeCount
+
+type StatisticsState
+    int totalTrades
+    int winningTrades
+    int losingTrades
+    float grossProfit
+    float grossLoss
+    float netProfit
+    float peakEquity
+    float dayStartEquity
+    int trackedDay
+
+type ConfigurationState
+    bool isValid
+    string message
+    bool symbolMatches
+    bool hasWarmup
+
+var TradeState tradeState = TradeState.new(TradeDirection.Flat, na, na, na, na, na, 0)
+var SessionState sessionState = SessionState.new(false, false, false, false, na, 0)
+var StatisticsState statisticsState = StatisticsState.new(0, 0, 0, 0.0, 0.0, 0.0, strategy.initial_capital, strategy.initial_capital, na)
+var ConfigurationState configurationState = ConfigurationState.new(false, "Initializing", false, false)
+
+//============================================================================== 
+// 5. UTILITY FUNCTIONS
+//============================================================================== 
+f_clamp(float value, float minimum, float maximum) =>
+    math.max(minimum, math.min(value, maximum))
+
+f_roundToTick(float price) =>
+    math.round(price / syminfo.mintick) * syminfo.mintick
+
+f_percentOf(float value, float percentage) =>
+    value * percentage * 0.01
+
+f_safeDivide(float numerator, float denominator, float fallback = 0.0) =>
+    denominator != 0.0 ? numerator / denominator : fallback
+
+f_formatPrice(float price) =>
+    na(price) ? "—" : str.tostring(price, format.mintick)
+
+f_formatPercent(float value) =>
+    na(value) ? "—" : str.tostring(value, "#.##") + "%"
+
+f_directionText(TradeDirection direction) =>
+    switch direction
+        TradeDirection.Long  => "LONG"
+        TradeDirection.Short => "SHORT"
+        => "FLAT"
+
+f_dashboardPosition(string selection) =>
+    switch selection
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        => position.top_right
+
+//============================================================================== 
+// 6. LOGGING
+//============================================================================== 
+f_log(LogLevel level, string message) =>
+    if enableLogging and barstate.isconfirmed
+        string prefix = switch level
+            LogLevel.Debug   => "DEBUG"
+            LogLevel.Info    => "INFO"
+            LogLevel.Warning => "WARN"
+            => "ERROR"
+        string event = "[" + STRATEGY_VERSION + "][" + prefix + "] " + message
+        switch level
+            LogLevel.Error   => log.error(event)
+            LogLevel.Warning => log.warning(event)
+            LogLevel.Info    => log.info(event)
+            => log.info(event)
+
+//============================================================================== 
+// 7. CONFIGURATION AND VALIDATION
+//============================================================================== 
+f_symbolMatches() =>
+    str.contains(str.upper(syminfo.tickerid), str.upper(tradeSymbol))
+
+f_hasWarmup() =>
+    bar_index >= warmupBars
+
+f_validateConfiguration() =>
+    bool validSymbol = f_symbolMatches()
+    bool validWarmup = f_hasWarmup()
+    bool validRisk = riskMode == RiskMode.FixedPercent ? riskPercent > 0.0 : fixedRiskCash > 0.0
+    bool validSession = not useSessionFilter or str.length(tradingSession) > 0
+    bool valid = enabled and validSymbol and validRisk and validSession
+    string message = not enabled ? "Strategy disabled" : not validSymbol ? "Chart symbol does not match expected symbol" : not validRisk ? "Risk configuration is invalid" : not validSession ? "Session configuration is invalid" : not validWarmup ? "Waiting for warm-up bars" : "Ready"
+    ConfigurationState.new(valid, message, validSymbol, validWarmup)
+
+//============================================================================== 
+// 8. SESSION MANAGER
+//============================================================================== 
+f_updateSessionState() =>
+    bool activeNow = not useSessionFilter or not na(time(timeframe.period, tradingSession, sessionTimezone))
+    bool openedNow = activeNow and not sessionState.isActive
+    bool closedNow = not activeNow and sessionState.isActive
+    sessionState.wasActive := sessionState.isActive
+    sessionState.isActive := activeNow
+    sessionState.justOpened := openedNow
+    sessionState.justClosed := closedNow
+    if openedNow
+        sessionState.sessionStartBar := bar_index
+        sessionState.sessionTradeCount := 0
+        f_log(LogLevel.Info, "Trading session opened")
+    if closedNow
+        f_log(LogLevel.Info, "Trading session closed")
+
+//============================================================================== 
+// 9. TRADE STATE MANAGER
+//============================================================================== 
+f_syncTradeState() =>
+    float positionSize = strategy.position_size
+    TradeDirection liveDirection = positionSize > 0 ? TradeDirection.Long : positionSize < 0 ? TradeDirection.Short : TradeDirection.Flat
+    if liveDirection != tradeState.direction
+        tradeState.direction := liveDirection
+        tradeState.entryPrice := liveDirection == TradeDirection.Flat ? na : strategy.position_avg_price
+        tradeState.entryBarIndex := liveDirection == TradeDirection.Flat ? na : bar_index
+        if liveDirection == TradeDirection.Flat
+            tradeState.stopPrice := na
+            tradeState.targetPrice := na
+            tradeState.quantity := na
+        else
+            tradeState.quantity := math.abs(positionSize)
+        f_log(LogLevel.Info, "Trade state changed to " + f_directionText(liveDirection))
+
+//============================================================================== 
+// 10. STATISTICS MANAGER
+//============================================================================== 
+f_updateStatistics() =>
+    int currentDay = dayofmonth(time)
+    if na(statisticsState.trackedDay) or currentDay != statisticsState.trackedDay
+        statisticsState.trackedDay := currentDay
+        statisticsState.dayStartEquity := strategy.equity
+    statisticsState.totalTrades := strategy.closedtrades
+    statisticsState.winningTrades := strategy.wintrades
+    statisticsState.losingTrades := strategy.losstrades
+    statisticsState.grossProfit := strategy.grossprofit
+    statisticsState.grossLoss := strategy.grossloss
+    statisticsState.netProfit := strategy.netprofit
+    statisticsState.peakEquity := math.max(statisticsState.peakEquity, strategy.equity)
+
+f_winRate() =>
+    f_safeDivide(statisticsState.winningTrades * 100.0, statisticsState.totalTrades)
+
+f_dailyLossPercent() =>
+    f_safeDivide(math.max(0.0, statisticsState.dayStartEquity - strategy.equity) * 100.0, statisticsState.dayStartEquity)
+
+//============================================================================== 
+// 11. DRAWING MANAGER
+//============================================================================== 
+var array<label> managedLabels = array.new_label()
+var label statusLabel = na
+
+f_trimLabels() =>
+    while array.size(managedLabels) > MAX_DRAWINGS
+        label.delete(array.shift(managedLabels))
+
+f_drawStatusLabel() =>
+    if showStatusLabel and barstate.islast
+        string status = configurationState.isValid and configurationState.hasWarmup ? "READY" : configurationState.message
+        color statusColor = configurationState.isValid and configurationState.hasWarmup ? color.green : color.orange
+        if na(statusLabel)
+            statusLabel := label.new(bar_index, high, status, style = label.style_label_down, textcolor = color.white, color = statusColor, size = size.small)
+            array.push(managedLabels, statusLabel)
+        else
+            label.set_xy(statusLabel, bar_index, high)
+            label.set_text(statusLabel, status)
+            label.set_color(statusLabel, statusColor)
+        f_trimLabels()
+    else if not na(statusLabel)
+        label.delete(statusLabel)
+        statusLabel := na
+
+//============================================================================== 
+// 12. DASHBOARD FRAMEWORK
+//============================================================================== 
+var table dashboard = table.new(f_dashboardPosition(dashboardPosition), 2, 8, border_width = 1)
+
+f_dashboardCell(int column, int row, string text, color background, color foreground = color.white) =>
+    table.cell(dashboard, column, row, text, text_color = foreground, bgcolor = background, text_size = size.small)
+
+f_updateDashboard() =>
+    if barstate.islast
+        if showDashboard
+            color headerColor = color.new(color.blue, 15)
+            color labelColor = color.new(color.black, 15)
+            color valueColor = color.new(color.black, 55)
+            color statusColor = configurationState.isValid and configurationState.hasWarmup ? color.new(color.green, 30) : color.new(color.orange, 30)
+            f_dashboardCell(0, 0, DASHBOARD_TITLE + " v" + STRATEGY_VERSION, headerColor)
+            f_dashboardCell(1, 0, configurationState.message, statusColor)
+            f_dashboardCell(0, 1, "Symbol", labelColor)
+            f_dashboardCell(1, 1, syminfo.ticker, valueColor)
+            f_dashboardCell(0, 2, "Session", labelColor)
+            f_dashboardCell(1, 2, sessionState.isActive ? "ACTIVE" : "CLOSED", valueColor)
+            f_dashboardCell(0, 3, "Position", labelColor)
+            f_dashboardCell(1, 3, f_directionText(tradeState.direction), valueColor)
+            f_dashboardCell(0, 4, "Closed trades", labelColor)
+            f_dashboardCell(1, 4, str.tostring(statisticsState.totalTrades), valueColor)
+            f_dashboardCell(0, 5, "Win rate", labelColor)
+            f_dashboardCell(1, 5, f_formatPercent(f_winRate()), valueColor)
+            f_dashboardCell(0, 6, "Net profit", labelColor)
+            f_dashboardCell(1, 6, str.tostring(statisticsState.netProfit, "#.##"), valueColor)
+            f_dashboardCell(0, 7, "Daily loss", labelColor)
+            f_dashboardCell(1, 7, f_formatPercent(f_dailyLossPercent()), valueColor)
+        else
+            table.clear(dashboard, 0, 0, 1, 7)
+
+//============================================================================== 
+// 13. CORE ORCHESTRATION
+//============================================================================== 
+// All state changes happen only on confirmed bars. This is the framework-level
+// non-repainting guarantee that later signal modules must preserve.
+if barstate.isconfirmed
+    configurationState := f_validateConfiguration()
+    f_updateSessionState()
+    f_syncTradeState()
+    f_updateStatistics()
+
+    if showValidation and not configurationState.isValid
+        f_log(LogLevel.Warning, configurationState.message)
+
+f_drawStatusLabel()
+f_updateDashboard()
+
