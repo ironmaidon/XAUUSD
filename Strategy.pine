@@ -1,14 +1,19 @@
 //@version=6
 // XAUUSD Institutional Framework
-// Version: 0.2.0
+// Version: 0.3.0
 //
 // Session and Opening Range engine. Every state mutation happens on confirmed
 // bars, so the engine never uses future values or repainting calculations.
+//
+// Changelog:
+// - 0.3.0: Added the non-repainting Trend Engine (EMA, HTF EMA, VWAP, ADX,
+//          pivot-based market structure, normalized scoring, and visuals).
+// - 0.2.0: Added the Session and Opening Range engines.
 
 //============================================================================== 
 // 1. STRATEGY DECLARATION
 //============================================================================== 
-strategy("XAUUSD Institutional Framework v0.2.0", "XAUUSD v0.2.0", overlay = true,
+strategy("XAUUSD Institutional Framework v0.3.0", "XAUUSD v0.3.0", overlay = true,
      pyramiding = 0, calc_on_every_tick = false, calc_on_order_fills = false,
      process_orders_on_close = true, initial_capital = 10000, currency = currency.USD,
      default_qty_type = strategy.percent_of_equity, default_qty_value = 1)
@@ -16,7 +21,7 @@ strategy("XAUUSD Institutional Framework v0.2.0", "XAUUSD v0.2.0", overlay = tru
 //============================================================================== 
 // 2. CONSTANTS AND ENUMS
 //============================================================================== 
-string STRATEGY_VERSION = "0.2.0"
+string STRATEGY_VERSION = "0.3.0"
 string DASHBOARD_TITLE = "XAUUSD SESSION ENGINE"
 int MILLISECONDS_PER_MINUTE = 60000
 int ATR_LENGTH = 14
@@ -38,6 +43,23 @@ enum BreakoutState
     TradeActive
     SessionFinished
 
+enum TrendDirection
+    Bullish
+    Bearish
+    Neutral
+
+enum TrendStrength
+    Weak
+    Moderate
+    Strong
+
+enum MarketStructure
+    HigherHigh
+    HigherLow
+    LowerHigh
+    LowerLow
+    Neutral
+
 //============================================================================== 
 // 3. INPUTS
 //============================================================================== 
@@ -49,6 +71,8 @@ string GROUP_CUSTOM = "5. Custom Session"
 string GROUP_OPENING_RANGE = "6. Opening Range"
 string GROUP_VISUALS = "7. Visuals"
 string GROUP_DASHBOARD = "8. Dashboard and Debug"
+string GROUP_TREND = "9. Trend Engine"
+string GROUP_TREND_VISUALS = "10. Trend Visuals"
 
 bool enabled = input.bool(true, "Enable strategy", group = GROUP_GENERAL)
 string expectedSymbol = input.string("XAUUSD", "Expected symbol", group = GROUP_GENERAL)
@@ -86,6 +110,19 @@ bool showRangeLabels = input.bool(true, "Draw range labels", group = GROUP_VISUA
 
 bool showDashboard = input.bool(true, "Show dashboard", group = GROUP_DASHBOARD)
 bool debugEnabled = input.bool(false, "Show debug panel", group = GROUP_DASHBOARD)
+
+bool emaFilterEnabled = input.bool(true, "Enable EMA filter", group = GROUP_TREND)
+int fastEmaLength = input.int(50, "Fast EMA length", minval = 1, group = GROUP_TREND)
+int slowEmaLength = input.int(200, "Slow EMA length", minval = 2, group = GROUP_TREND)
+string htfTimeframe = input.timeframe("15", "HTF EMA timeframe", group = GROUP_TREND)
+bool vwapFilterEnabled = input.bool(true, "Enable VWAP filter", group = GROUP_TREND)
+int adxLength = input.int(14, "ADX length", minval = 1, group = GROUP_TREND)
+float adxTrendThreshold = input.float(20.0, "ADX trending threshold", minval = 1.0, step = 0.5, group = GROUP_TREND)
+int pivotLength = input.int(5, "Market structure pivot length", minval = 1, group = GROUP_TREND)
+
+bool showEmaPlots = input.bool(true, "Plot EMAs", group = GROUP_TREND_VISUALS)
+bool showTrendBackground = input.bool(false, "Color trend background", group = GROUP_TREND_VISUALS)
+bool showTrendLabel = input.bool(false, "Show trend label", group = GROUP_TREND_VISUALS)
 
 //============================================================================== 
 // 4. STATE MODELS
@@ -132,10 +169,31 @@ type SessionStatistics
     int falseBreakouts
     int successfulBreakouts
 
+type TrendEngineState
+    TrendDirection direction
+    TrendStrength strength
+    MarketStructure structure
+    float score
+    float fastEma
+    float slowEma
+    float htfFastEma
+    float htfSlowEma
+    float vwapValue
+    float vwapDistance
+    float vwapSlope
+    float adx
+    float plusDi
+    float minusDi
+    float swingHigh
+    float swingLow
+    bool structureBreak
+    bool isTrending
+
 var SessionEngineState sessionState = SessionEngineState.new(SessionName.None, false, false, false, na, 0, 0, 0.0, 0)
 var OpeningRangeState rangeState = OpeningRangeState.new(na, na, na, na, na, na, na, na, na, 0, false, false, false)
 var TradeControlState tradeControl = TradeControlState.new(false, false, false, false)
 var SessionStatistics sessionStatistics = SessionStatistics.new(0, 0.0, na, na, 0.0, 0, 0, 0)
+var TrendEngineState trendState = TrendEngineState.new(TrendDirection.Neutral, TrendStrength.Weak, MarketStructure.Neutral, 0.0, na, na, na, na, na, na, na, na, na, na, na, na, false, false)
 var BreakoutState breakoutState = BreakoutState.Waiting
 var int breakoutDirection = 0
 var float atrAtRangeCompletion = na
@@ -210,6 +268,99 @@ CurrentSession() =>
     bool newYorkActive = newYorkEnabled and IsInSession(BuildSession(newYorkStart, newYorkEnd), newYorkTimezone)
     bool customActive = customEnabled and IsInSession(BuildSession(customStart, customEnd), customTimezone)
     asiaActive ? SessionName.Asia : londonActive ? SessionName.London : newYorkActive ? SessionName.NewYork : customActive ? SessionName.Custom : SessionName.None
+
+// Returns a concise label for a trend direction.
+TrendDirectionText(TrendDirection direction) =>
+    direction == TrendDirection.Bullish ? "Bullish" : direction == TrendDirection.Bearish ? "Bearish" : "Neutral"
+
+// Returns a concise label for the calculated trend strength.
+TrendStrengthText(TrendStrength strength) =>
+    strength == TrendStrength.Strong ? "Strong" : strength == TrendStrength.Moderate ? "Moderate" : "Weak"
+
+// Returns a concise label for the latest confirmed market-structure event.
+MarketStructureText(MarketStructure structure) =>
+    structure == MarketStructure.HigherHigh ? "Higher High" : structure == MarketStructure.HigherLow ? "Higher Low" : structure == MarketStructure.LowerHigh ? "Lower High" : structure == MarketStructure.LowerLow ? "Lower Low" : "Neutral"
+
+// Returns the current normalized direction computed by the Trend Engine.
+GetTrendDirection() =>
+    trendState.direction
+
+// Returns the current normalized 0-100 trend score.
+GetTrendScore() =>
+    trendState.score
+
+// Returns true only when the normalized Trend Engine direction is bullish.
+IsBullTrend() =>
+    GetTrendDirection() == TrendDirection.Bullish
+
+// Returns true only when the normalized Trend Engine direction is bearish.
+IsBearTrend() =>
+    GetTrendDirection() == TrendDirection.Bearish
+
+// Returns true when ADX is at or above the configured trending threshold.
+IsTrending() =>
+    trendState.isTrending
+
+// Returns true when ADX is below the configured trending threshold.
+IsRanging() =>
+    not IsTrending()
+
+// Returns the latest confirmed pivot-based market-structure classification.
+GetMarketStructure() =>
+    trendState.structure
+
+//==============================================================================
+// 6. TREND ENGINE
+//==============================================================================
+var float priorSwingHigh = na
+var float priorSwingLow = na
+
+// Updates swing prices and structure only after a pivot is confirmed.
+UpdateMarketStructure(float pivotHigh, float pivotLow) =>
+    trendState.structureBreak := false
+    if not na(pivotHigh)
+        priorSwingHigh := trendState.swingHigh
+        trendState.swingHigh := pivotHigh
+        if not na(priorSwingHigh)
+            trendState.structure := pivotHigh > priorSwingHigh ? MarketStructure.HigherHigh : MarketStructure.LowerHigh
+    if not na(pivotLow)
+        priorSwingLow := trendState.swingLow
+        trendState.swingLow := pivotLow
+        if not na(priorSwingLow)
+            trendState.structure := pivotLow > priorSwingLow ? MarketStructure.HigherLow : MarketStructure.LowerLow
+    bool breaksHigh = not na(priorSwingHigh) and ta.crossover(close, priorSwingHigh)
+    bool breaksLow = not na(priorSwingLow) and ta.crossunder(close, priorSwingLow)
+    trendState.structureBreak := breaksHigh or breaksLow
+
+// Derives direction, strength, and the 0-100 score from reusable trend inputs.
+UpdateTrendEngine(float fastEma, float slowEma, float htfFastEma, float htfSlowEma, float vwapValue, float adxValue, float plusDiValue, float minusDiValue, float pivotHigh, float pivotLow) =>
+    trendState.fastEma := fastEma
+    trendState.slowEma := slowEma
+    trendState.htfFastEma := htfFastEma
+    trendState.htfSlowEma := htfSlowEma
+    trendState.vwapValue := vwapValue
+    trendState.vwapDistance := close - vwapValue
+    trendState.vwapSlope := vwapValue - vwapValue[1]
+    trendState.adx := adxValue
+    trendState.plusDi := plusDiValue
+    trendState.minusDi := minusDiValue
+    trendState.isTrending := adxValue >= adxTrendThreshold
+    UpdateMarketStructure(pivotHigh, pivotLow)
+
+    bool emaBullish = emaFilterEnabled and fastEma > slowEma
+    bool emaBearish = emaFilterEnabled and fastEma < slowEma
+    bool htfBullish = emaFilterEnabled and htfFastEma > htfSlowEma
+    bool htfBearish = emaFilterEnabled and htfFastEma < htfSlowEma
+    bool vwapBullish = vwapFilterEnabled and close > vwapValue
+    bool vwapBearish = vwapFilterEnabled and close < vwapValue
+    bool structureBullish = trendState.structure == MarketStructure.HigherHigh or trendState.structure == MarketStructure.HigherLow
+    bool structureBearish = trendState.structure == MarketStructure.LowerHigh or trendState.structure == MarketStructure.LowerLow
+
+    float bullScore = (emaBullish ? 30.0 : 0.0) + (htfBullish ? 25.0 : 0.0) + (vwapBullish ? 15.0 : 0.0) + (trendState.isTrending and plusDiValue > minusDiValue ? 20.0 : 0.0) + (structureBullish ? 10.0 : 0.0)
+    float bearScore = (emaBearish ? 30.0 : 0.0) + (htfBearish ? 25.0 : 0.0) + (vwapBearish ? 15.0 : 0.0) + (trendState.isTrending and minusDiValue > plusDiValue ? 20.0 : 0.0) + (structureBearish ? 10.0 : 0.0)
+    trendState.score := math.max(bullScore, bearScore)
+    trendState.direction := bullScore > bearScore ? TrendDirection.Bullish : bearScore > bullScore ? TrendDirection.Bearish : TrendDirection.Neutral
+    trendState.strength := trendState.score >= 70.0 ? TrendStrength.Strong : trendState.score >= 45.0 ? TrendStrength.Moderate : TrendStrength.Weak
 
 //============================================================================== 
 // 6. SESSION ENGINE
@@ -392,10 +543,32 @@ UpdateRangeDrawings() =>
         label.set_color(rangeLowLabel, color.new(rangeColor, 100))
         label.set_color(rangeWidthLabel, color.new(rangeColor, 100))
 
+//==============================================================================
+// 10. TREND VISUALS
+//==============================================================================
+var label trendLabel = na
+
+// Returns a display color for the current normalized trend direction.
+TrendColor() =>
+    IsBullTrend() ? color.lime : IsBearTrend() ? color.red : color.gray
+
+// Updates one reusable label with the current normalized trend state.
+UpdateTrendLabel() =>
+    if showTrendLabel and barstate.islast
+        string labelText = TrendDirectionText(GetTrendDirection()) + " " + str.tostring(GetTrendScore(), "#.##") + " / " + TrendStrengthText(trendState.strength)
+        if na(trendLabel)
+            trendLabel := label.new(bar_index, high, labelText, style = label.style_label_down, color = TrendColor(), textcolor = color.white, size = size.small)
+        else
+            label.set_xy(trendLabel, bar_index, high)
+            label.set_text(trendLabel, labelText)
+            label.set_color(trendLabel, TrendColor())
+    else if not na(trendLabel)
+        label.set_color(trendLabel, color.new(TrendColor(), 100))
+
 //============================================================================== 
-// 10. DASHBOARD AND DEBUG
+// 11. DASHBOARD AND DEBUG
 //============================================================================== 
-var table dashboard = table.new(position.top_right, 2, 8, border_width = 1)
+var table dashboard = table.new(position.top_right, 2, 15, border_width = 1)
 var table debugTable = table.new(position.bottom_right, 2, 6, border_width = 1)
 
 // Writes one consistently styled dashboard row.
@@ -415,8 +588,15 @@ UpdateDashboard() =>
             SetDashboardRow(dashboard, 5, "Session progress", FormatPercent(sessionState.progressPercent))
             SetDashboardRow(dashboard, 6, "Bars in session", str.tostring(sessionState.barsInSession))
             SetDashboardRow(dashboard, 7, "Bars remaining", str.tostring(sessionState.barsRemaining))
+            SetDashboardRow(dashboard, 8, "Current trend", TrendDirectionText(GetTrendDirection()))
+            SetDashboardRow(dashboard, 9, "Trend score", str.tostring(GetTrendScore(), "#.##"))
+            SetDashboardRow(dashboard, 10, "EMA direction", trendState.fastEma > trendState.slowEma ? "Bullish" : trendState.fastEma < trendState.slowEma ? "Bearish" : "Neutral")
+            SetDashboardRow(dashboard, 11, "HTF direction", trendState.htfFastEma > trendState.htfSlowEma ? "Bullish" : trendState.htfFastEma < trendState.htfSlowEma ? "Bearish" : "Neutral")
+            SetDashboardRow(dashboard, 12, "VWAP status", close > trendState.vwapValue ? "Above" : close < trendState.vwapValue ? "Below" : "At VWAP")
+            SetDashboardRow(dashboard, 13, "ADX", str.tostring(trendState.adx, "#.##"))
+            SetDashboardRow(dashboard, 14, "Structure", MarketStructureText(GetMarketStructure()))
         else
-            table.clear(dashboard, 0, 0, 1, 7)
+            table.clear(dashboard, 0, 0, 1, 14)
 
 // Updates the diagnostic panel only on the last chart bar when debugging is enabled.
 UpdateDebugPanel() =>
@@ -432,12 +612,20 @@ UpdateDebugPanel() =>
             table.clear(debugTable, 0, 0, 1, 5)
 
 //============================================================================== 
-// 11. ORCHESTRATION
+// 12. ORCHESTRATION
 //============================================================================== 
 float atrValue = ta.atr(ATR_LENGTH)
+float fastEmaValue = ta.ema(close, fastEmaLength)
+float slowEmaValue = ta.ema(close, slowEmaLength)
+[htfFastEmaValue, htfSlowEmaValue] = request.security(syminfo.tickerid, htfTimeframe, [ta.ema(close, fastEmaLength), ta.ema(close, slowEmaLength)], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+float vwapValue = ta.vwap(hlc3)
+[plusDiValue, minusDiValue, adxValue] = ta.dmi(adxLength, adxLength)
+float confirmedPivotHigh = ta.pivothigh(high, pivotLength, pivotLength)
+float confirmedPivotLow = ta.pivotlow(low, pivotLength, pivotLength)
 bool symbolMatches = str.contains(str.upper(syminfo.tickerid), str.upper(expectedSymbol))
 
 if barstate.isconfirmed
+    UpdateTrendEngine(fastEmaValue, slowEmaValue, htfFastEmaValue, htfSlowEmaValue, vwapValue, adxValue, plusDiValue, minusDiValue, confirmedPivotHigh, confirmedPivotLow)
     UpdateSessionEngine()
     if sessionState.justEnded
         if rangeState.isComplete
@@ -451,5 +639,11 @@ if barstate.isconfirmed
         UpdateBreakoutState()
 
 UpdateRangeDrawings()
+UpdateTrendLabel()
 UpdateDashboard()
 UpdateDebugPanel()
+
+plot(showEmaPlots ? fastEmaValue : na, "Fast EMA", color = color.teal, linewidth = 2)
+plot(showEmaPlots ? slowEmaValue : na, "Slow EMA", color = color.orange, linewidth = 2)
+color trendBackground = IsBullTrend() ? color.new(color.lime, 90) : IsBearTrend() ? color.new(color.red, 90) : color.new(color.gray, 95)
+bgcolor(showTrendBackground ? trendBackground : na, title = "Trend Background")
