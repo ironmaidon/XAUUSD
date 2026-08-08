@@ -1,11 +1,14 @@
 //@version=6
 // XAUUSD Institutional Framework
-// Version: 0.4.0
+// Version: 0.5.0
 //
 // Session and Opening Range engine. Every state mutation happens on confirmed
 // bars, so the engine never uses future values or repainting calculations.
 //
 // Changelog:
+// - 0.5.0: Added retest lifecycle, tolerance and penetration controls, retest
+//          windows, pattern/quality confirmation, scoring, close-failure
+//          confirmation, controlled retries, event visuals, and dashboard state.
 // - 0.4.0: Added confirmed-candle breakout state, buffers, candle quality,
 //          momentum, scoring, failure/attempt controls, visuals, and dashboard.
 // - 0.3.0: Added the non-repainting Trend Engine (EMA, HTF EMA, VWAP, ADX,
@@ -15,7 +18,7 @@
 //============================================================================== 
 // 1. STRATEGY DECLARATION
 //============================================================================== 
-strategy("XAUUSD Institutional Framework v0.4.0", "XAUUSD v0.4.0", overlay = true,
+strategy("XAUUSD Institutional Framework v0.5.0", "XAUUSD v0.5.0", overlay = true,
      pyramiding = 0, calc_on_every_tick = false, calc_on_order_fills = false,
      process_orders_on_close = true, initial_capital = 10000, currency = currency.USD,
      default_qty_type = strategy.percent_of_equity, default_qty_value = 1)
@@ -23,7 +26,7 @@ strategy("XAUUSD Institutional Framework v0.4.0", "XAUUSD v0.4.0", overlay = tru
 //============================================================================== 
 // 2. CONSTANTS AND ENUMS
 //============================================================================== 
-string STRATEGY_VERSION = "0.4.0"
+string STRATEGY_VERSION = "0.5.0"
 string DASHBOARD_TITLE = "XAUUSD SESSION ENGINE"
 int MILLISECONDS_PER_MINUTE = 60000
 int ATR_LENGTH = 14
@@ -55,6 +58,31 @@ enum TradeDirection
     None
     Long
     Short
+
+enum RetestState
+    None
+    WaitingForRetest
+    RetestDetected
+    RetestConfirmed
+    RetestFailed
+    Expired
+
+enum RetestWindowMode
+    Bars
+    Minutes
+
+enum RetestDistanceMode
+    Ticks
+    Atr
+    Percentage
+
+enum RetestConfirmationMode
+    TouchAndClose
+    Rejection
+    PinBar
+    Engulfing
+    AnyPattern
+    Strict
 
 enum BreakoutBufferMode
     Ticks
@@ -99,6 +127,7 @@ string GROUP_DASHBOARD = "8. Dashboard and Debug"
 string GROUP_TREND = "9. Trend Engine"
 string GROUP_TREND_VISUALS = "10. Trend Visuals"
 string GROUP_BREAKOUT = "11. Breakout Engine"
+string GROUP_RETEST = "12. Retest Engine"
 
 bool enabled = input.bool(true, "Enable strategy", group = GROUP_GENERAL)
 string expectedSymbol = input.string("XAUUSD", "Expected symbol", group = GROUP_GENERAL)
@@ -172,6 +201,27 @@ float minimumBreakoutScore = input.float(55.0, "Minimum breakout score", minval 
 bool showBreakoutMarkers = input.bool(true, "Show breakout markers", group = GROUP_BREAKOUT)
 bool showBreakoutScore = input.bool(true, "Show breakout score", group = GROUP_BREAKOUT)
 bool showBreakoutLevels = input.bool(true, "Show breakout levels", group = GROUP_BREAKOUT)
+bool retestEnabled = input.bool(true, "Enable retest engine", group = GROUP_RETEST)
+RetestWindowMode retestWindowMode = input.enum(RetestWindowMode.Minutes, "Retest window mode", group = GROUP_RETEST)
+int retestWindowValue = input.int(60, "Retest window", minval = 1, group = GROUP_RETEST)
+RetestDistanceMode retestToleranceMode = input.enum(RetestDistanceMode.Atr, "Tolerance mode", group = GROUP_RETEST)
+float retestToleranceValue = input.float(0.10, "Tolerance value", minval = 0.0, group = GROUP_RETEST)
+RetestDistanceMode maximumPenetrationMode = input.enum(RetestDistanceMode.Atr, "Maximum penetration mode", group = GROUP_RETEST)
+float maximumPenetrationValue = input.float(0.25, "Maximum penetration value", minval = 0.0, group = GROUP_RETEST)
+RetestConfirmationMode retestConfirmationMode = input.enum(RetestConfirmationMode.Strict, "Confirmation mode", group = GROUP_RETEST)
+bool requireRetestRejection = input.bool(true, "Require rejection candle", group = GROUP_RETEST)
+float minimumRetestBodyPercent = input.float(35.0, "Minimum retest body %", minval = 0, maxval = 100, group = GROUP_RETEST)
+float minimumRetestRejectionWickPercent = input.float(35.0, "Minimum rejection wick %", minval = 0, maxval = 100, group = GROUP_RETEST)
+float minimumRetestClosePositionPercent = input.float(60.0, "Minimum retest close position %", minval = 0, maxval = 100, group = GROUP_RETEST)
+bool enableRetestPinBar = input.bool(true, "Enable pin bar", group = GROUP_RETEST)
+bool enableRetestEngulfing = input.bool(true, "Enable engulfing", group = GROUP_RETEST)
+bool enableStrongRetestRejection = input.bool(true, "Enable strong rejection", group = GROUP_RETEST)
+float retestScoreThreshold = input.float(60.0, "Retest score threshold", minval = 0.0, maxval = 100.0, group = GROUP_RETEST)
+int retestFailureConfirmationBars = input.int(1, "Failure confirmation bars", minval = 1, group = GROUP_RETEST)
+bool allowMultipleRetestAttempts = input.bool(false, "Allow multiple retest attempts", group = GROUP_RETEST)
+bool showRetestMarkers = input.bool(true, "Show retest markers", group = GROUP_RETEST)
+bool showRetestScore = input.bool(true, "Show retest score", group = GROUP_RETEST)
+bool showRetestLevel = input.bool(true, "Show retest level", group = GROUP_RETEST)
 
 //============================================================================== 
 // 4. STATE MODELS
@@ -275,6 +325,25 @@ var float breakoutScore = na
 var BreakoutStrength breakoutStrength = BreakoutStrength.Weak
 var int bullishFailureCount = 0
 var int bearishFailureCount = 0
+var RetestState retestState = RetestState.None
+var float retestLevel = na
+var float retestScore = na
+var int retestBarIndex = na
+var int retestStartBarIndex = na
+var int retestStartTime = na
+var TradeDirection retestTradeDirection = TradeDirection.None
+var float retestDistance = na
+var float retestDistanceATR = na
+var float retestPenetration = na
+var float retestPenetrationATR = na
+var int retestBarsSinceBreakout = na
+var bool retestAttempted = false
+var bool retestConfirmed = false
+var bool retestFailed = false
+var int bullishRetestFailureCount = 0
+var int bearishRetestFailureCount = 0
+var int retestAttemptCount = 0
+var bool retestRetryPending = false
 
 //============================================================================== 
 // 5. UTILITY FUNCTIONS
@@ -315,6 +384,22 @@ BreakoutDirectionText(TradeDirection direction) =>
 // Returns a display label for every M4 breakout-strength enum member.
 BreakoutStrengthText(BreakoutStrength strength) =>
     strength == BreakoutStrength.Extreme ? "Extreme" : strength == BreakoutStrength.Strong ? "Strong" : strength == BreakoutStrength.Normal ? "Normal" : "Weak"
+
+// Returns a display label for every M5 retest-state enum member.
+RetestStateText(RetestState state) =>
+    state == RetestState.WaitingForRetest ? "Waiting" : state == RetestState.RetestDetected ? "Detected" : state == RetestState.RetestConfirmed ? "Confirmed" : state == RetestState.RetestFailed ? "Failed" : state == RetestState.Expired ? "Expired" : "None"
+
+// Returns a display label for an M5 retest direction.
+RetestDirectionText(TradeDirection direction) =>
+    direction == TradeDirection.Long ? "Bullish" : direction == TradeDirection.Short ? "Bearish" : "None"
+
+// Formats a nullable decimal value for the dashboard without displaying na.
+FormatValueOrDash(float value) =>
+    na(value) ? "-" : str.tostring(value, "#.##")
+
+// Formats a nullable integer value for the dashboard without displaying na.
+FormatIntOrDash(int value) =>
+    na(value) ? "-" : str.tostring(value)
 
 // Prevents division-by-zero while preserving a caller supplied fallback value.
 SafeDivide(float numerator, float denominator, float fallback) =>
@@ -626,7 +711,7 @@ CalculateTrendLabel(label previousLabel) =>
 //============================================================================== 
 // 11. DASHBOARD AND DEBUG
 //============================================================================== 
-var table dashboard = table.new(position.top_right, 2, 23, border_width = 1)
+var table dashboard = table.new(position.top_right, 2, 34, border_width = 1)
 var table debugTable = table.new(position.bottom_right, 2, 6, border_width = 1)
 
 // Writes one consistently styled dashboard row.
@@ -661,8 +746,19 @@ UpdateDashboard() =>
             SetDashboardRow(dashboard, 20, "Breakout attempted", breakoutAttempted ? "Yes" : "No")
             SetDashboardRow(dashboard, 21, "Breakout confirmed", breakoutConfirmed ? "Yes" : "No")
             SetDashboardRow(dashboard, 22, "Breakout failed", breakoutFailed ? "Yes" : "No")
+            SetDashboardRow(dashboard, 23, "Retest state", RetestStateText(retestState))
+            SetDashboardRow(dashboard, 24, "Retest direction", RetestDirectionText(retestTradeDirection))
+            SetDashboardRow(dashboard, 25, "Retest level", na(retestLevel) ? "-" : FormatPrice(retestLevel))
+            SetDashboardRow(dashboard, 26, "Retest score", FormatValueOrDash(retestScore))
+            SetDashboardRow(dashboard, 27, "Retest attempts", str.tostring(retestAttemptCount))
+            SetDashboardRow(dashboard, 28, "Retry pending", retestRetryPending ? "Yes" : "No")
+            SetDashboardRow(dashboard, 29, "Bars since breakout", FormatIntOrDash(retestBarsSinceBreakout))
+            SetDashboardRow(dashboard, 30, "Retest distance ATR", FormatValueOrDash(retestDistanceATR))
+            SetDashboardRow(dashboard, 31, "Retest penetration ATR", FormatValueOrDash(retestPenetrationATR))
+            SetDashboardRow(dashboard, 32, "Retest confirmed", retestConfirmed ? "Yes" : "No")
+            SetDashboardRow(dashboard, 33, "Retest failed", retestFailed ? "Yes" : "No")
         else
-            table.clear(dashboard, 0, 0, 1, 22)
+            table.clear(dashboard, 0, 0, 1, 33)
 
 // Updates the diagnostic panel only on the last chart bar when debugging is enabled.
 UpdateDebugPanel() =>
@@ -734,6 +830,61 @@ bool breakoutWindowValid = rangeState.isComplete and sessionState.isActive and (
 bool breakoutAttemptGate = allowMultipleBreakoutAttempts or not breakoutAttempted
 bool bullishBreakoutAccepted = barstate.isconfirmed and breakoutWindowValid and breakoutAttemptGate and bullishBreakoutCandidate and bullishBreakoutQualityPass and not bearishBreakoutCandidate
 bool bearishBreakoutAccepted = barstate.isconfirmed and breakoutWindowValid and breakoutAttemptGate and bearishBreakoutCandidate and bearishBreakoutQualityPass and not bullishBreakoutCandidate
+bool bullishRetestDetected = false
+bool bearishRetestDetected = false
+bool bullishRetestConfirmed = false
+bool bearishRetestConfirmed = false
+bool bullishRetestFailure = false
+bool bearishRetestFailure = false
+bool retestPendingState = retestState == RetestState.WaitingForRetest or retestState == RetestState.RetestDetected
+bool retestWindowState = retestPendingState or (retestState == RetestState.RetestFailed and retestRetryPending)
+bool retestWindowValid = retestWindowState and not na(retestStartBarIndex) and (retestWindowMode == RetestWindowMode.Bars ? bar_index - retestStartBarIndex <= retestWindowValue : time - retestStartTime <= retestWindowValue * MILLISECONDS_PER_MINUTE)
+bool retestRetryEligible = allowMultipleRetestAttempts and retestState == RetestState.RetestFailed and not retestConfirmed and retestRetryPending and retestWindowValid and ((retestTradeDirection == TradeDirection.Long and breakoutState != BreakoutState.BullishFailed) or (retestTradeDirection == TradeDirection.Short and breakoutState != BreakoutState.BearishFailed))
+float retestTolerance = na(retestLevel) ? na : retestToleranceMode == RetestDistanceMode.Ticks ? retestToleranceValue * syminfo.mintick : retestToleranceMode == RetestDistanceMode.Atr ? atrValue * retestToleranceValue : retestLevel * retestToleranceValue * 0.01
+float maximumRetestPenetration = na(retestLevel) ? na : maximumPenetrationMode == RetestDistanceMode.Ticks ? maximumPenetrationValue * syminfo.mintick : maximumPenetrationMode == RetestDistanceMode.Atr ? atrValue * maximumPenetrationValue : retestLevel * maximumPenetrationValue * 0.01
+bool retestActive = retestEnabled and retestWindowValid and not na(retestLevel) and retestTradeDirection != TradeDirection.None and not retestConfirmed and not retestFailed
+bool bullishRetestInteraction = retestActive and retestTradeDirection == TradeDirection.Long and bar_index > retestStartBarIndex and low <= retestLevel + retestTolerance and low >= retestLevel - maximumRetestPenetration
+bool bearishRetestInteraction = retestActive and retestTradeDirection == TradeDirection.Short and bar_index > retestStartBarIndex and high >= retestLevel - retestTolerance and high <= retestLevel + maximumRetestPenetration
+bool bullishRetestContext = retestEnabled and retestTradeDirection == TradeDirection.Long and retestPendingState and not na(retestLevel) and not na(retestStartBarIndex) and bar_index > retestStartBarIndex
+bool bearishRetestContext = retestEnabled and retestTradeDirection == TradeDirection.Short and retestPendingState and not na(retestLevel) and not na(retestStartBarIndex) and bar_index > retestStartBarIndex
+bool bullishRetestCandleQuality = barstate.isconfirmed and bodyPercent >= minimumRetestBodyPercent and lowerWickPercent >= minimumRetestRejectionWickPercent and bullishClosePosition >= minimumRetestClosePositionPercent
+bool bearishRetestCandleQuality = barstate.isconfirmed and bodyPercent >= minimumRetestBodyPercent and upperWickPercent >= minimumRetestRejectionWickPercent and bearishClosePosition >= minimumRetestClosePositionPercent
+bool bullishTouchAndClose = bullishRetestContext and bullishRetestInteraction and barstate.isconfirmed and close >= retestLevel
+bool bearishTouchAndClose = bearishRetestContext and bearishRetestInteraction and barstate.isconfirmed and close <= retestLevel
+bool bullishRetestPinBar = bullishRetestContext and bullishRetestInteraction and bullishRetestCandleQuality and close >= retestLevel and upperWick <= lowerWick
+bool bearishRetestPinBar = bearishRetestContext and bearishRetestInteraction and bearishRetestCandleQuality and close <= retestLevel and lowerWick <= upperWick
+bool bullishRetestEngulfing = bullishRetestContext and barstate.isconfirmed and close > open and close[1] < open[1] and open <= close[1] and close >= open[1]
+bool bearishRetestEngulfing = bearishRetestContext and barstate.isconfirmed and close < open and close[1] > open[1] and open >= close[1] and close <= open[1]
+bool bullishStrongRetestRejection = bullishRetestContext and bullishRetestInteraction and bullishRetestCandleQuality and close >= retestLevel
+bool bearishStrongRetestRejection = bearishRetestContext and bearishRetestInteraction and bearishRetestCandleQuality and close <= retestLevel
+bool bullishAnyRetestPattern = (enableRetestPinBar and bullishRetestPinBar) or (enableRetestEngulfing and bullishRetestEngulfing) or (enableStrongRetestRejection and bullishStrongRetestRejection)
+bool bearishAnyRetestPattern = (enableRetestPinBar and bearishRetestPinBar) or (enableRetestEngulfing and bearishRetestEngulfing) or (enableStrongRetestRejection and bearishStrongRetestRejection)
+bool longRetestScoringActive = retestActive and retestTradeDirection == TradeDirection.Long
+bool shortRetestScoringActive = retestActive and retestTradeDirection == TradeDirection.Short
+float levelDistanceRatio = retestTolerance > 0 and not na(retestDistance) ? math.min(math.max(retestDistance / retestTolerance, 0.0), 1.0) : 1.0
+float bullishLevelScore = longRetestScoringActive and bullishRetestInteraction ? 25.0 * (1.0 - levelDistanceRatio) : 0.0
+float bearishLevelScore = shortRetestScoringActive and bearishRetestInteraction ? 25.0 * (1.0 - levelDistanceRatio) : 0.0
+float bullishRejectionScore = longRetestScoringActive ? math.min(25.0, (bullishStrongRetestRejection ? 10.0 : 0.0) + math.min(lowerWickPercent, 100.0) * 0.08 + math.min(bullishClosePosition, 100.0) * 0.07) : 0.0
+float bearishRejectionScore = shortRetestScoringActive ? math.min(25.0, (bearishStrongRetestRejection ? 10.0 : 0.0) + math.min(upperWickPercent, 100.0) * 0.08 + math.min(bearishClosePosition, 100.0) * 0.07) : 0.0
+float bullishStructureScore = longRetestScoringActive ? math.min(20.0, (bullishRetestCandleQuality ? 10.0 : 0.0) + (bullishAnyRetestPattern ? 7.0 : 0.0) + ((bullishRetestPinBar and bullishRetestEngulfing) ? 3.0 : 0.0)) : 0.0
+float bearishStructureScore = shortRetestScoringActive ? math.min(20.0, (bearishRetestCandleQuality ? 10.0 : 0.0) + (bearishAnyRetestPattern ? 7.0 : 0.0) + ((bearishRetestPinBar and bearishRetestEngulfing) ? 3.0 : 0.0)) : 0.0
+float penetrationRatio = maximumRetestPenetration > 0 and not na(retestPenetration) ? math.min(math.max(retestPenetration / maximumRetestPenetration, 0.0), 1.0) : 0.0
+float penetrationQualityScore = retestActive and not na(retestPenetration) ? 15.0 * (1.0 - penetrationRatio) : 0.0
+float timingFraction = retestActive ? (retestWindowMode == RetestWindowMode.Bars ? math.min(math.max(SafeDivide(retestBarsSinceBreakout, retestWindowValue, 1.0), 0.0), 1.0) : math.min(math.max(SafeDivide(time - retestStartTime, retestWindowValue * MILLISECONDS_PER_MINUTE, 1.0), 0.0), 1.0)) : 1.0
+float timingQualityScore = retestActive ? 15.0 * (1.0 - timingFraction) : 0.0
+float bullishRetestScore = longRetestScoringActive ? math.max(0.0, math.min(100.0, bullishLevelScore + bullishRejectionScore + bullishStructureScore + penetrationQualityScore + timingQualityScore)) : 0.0
+float bearishRetestScore = shortRetestScoringActive ? math.max(0.0, math.min(100.0, bearishLevelScore + bearishRejectionScore + bearishStructureScore + penetrationQualityScore + timingQualityScore)) : 0.0
+bool bullishRetestQualityPass = longRetestScoringActive and bullishRetestScore >= retestScoreThreshold
+bool bearishRetestQualityPass = shortRetestScoringActive and bearishRetestScore >= retestScoreThreshold
+bool retestPatternEnabled = enableRetestPinBar or enableRetestEngulfing or enableStrongRetestRejection
+bool bullishModePass = retestConfirmationMode == RetestConfirmationMode.TouchAndClose ? bullishTouchAndClose : retestConfirmationMode == RetestConfirmationMode.Rejection ? bullishStrongRetestRejection : retestConfirmationMode == RetestConfirmationMode.PinBar ? enableRetestPinBar and bullishRetestPinBar : retestConfirmationMode == RetestConfirmationMode.Engulfing ? enableRetestEngulfing and bullishRetestEngulfing : retestConfirmationMode == RetestConfirmationMode.AnyPattern ? bullishAnyRetestPattern : bullishTouchAndClose and bullishRetestCandleQuality and bullishStrongRetestRejection and (not retestPatternEnabled or bullishAnyRetestPattern)
+bool bearishModePass = retestConfirmationMode == RetestConfirmationMode.TouchAndClose ? bearishTouchAndClose : retestConfirmationMode == RetestConfirmationMode.Rejection ? bearishStrongRetestRejection : retestConfirmationMode == RetestConfirmationMode.PinBar ? enableRetestPinBar and bearishRetestPinBar : retestConfirmationMode == RetestConfirmationMode.Engulfing ? enableRetestEngulfing and bearishRetestEngulfing : retestConfirmationMode == RetestConfirmationMode.AnyPattern ? bearishAnyRetestPattern : bearishTouchAndClose and bearishRetestCandleQuality and bearishStrongRetestRejection and (not retestPatternEnabled or bearishAnyRetestPattern)
+bool bullishRetestCloseFailure = retestTradeDirection == TradeDirection.Long and retestState == RetestState.RetestDetected and retestAttempted and not retestConfirmed and not na(retestLevel) and not na(maximumRetestPenetration) and barstate.isconfirmed and close < retestLevel - maximumRetestPenetration
+bool bearishRetestCloseFailure = retestTradeDirection == TradeDirection.Short and retestState == RetestState.RetestDetected and retestAttempted and not retestConfirmed and not na(retestLevel) and not na(maximumRetestPenetration) and barstate.isconfirmed and close > retestLevel + maximumRetestPenetration
+bool bullishRetestFailureThresholdReached = retestState == RetestState.RetestDetected and retestTradeDirection == TradeDirection.Long and bullishRetestCloseFailure and bullishRetestFailureCount + 1 >= retestFailureConfirmationBars
+bool bearishRetestFailureThresholdReached = retestState == RetestState.RetestDetected and retestTradeDirection == TradeDirection.Short and bearishRetestCloseFailure and bearishRetestFailureCount + 1 >= retestFailureConfirmationBars
+bool bullishRetestConfirmationCandidate = barstate.isconfirmed and bullishRetestContext and retestWindowValid and not retestFailed and not retestConfirmed and not bullishRetestFailureThresholdReached and bullishModePass and bullishRetestQualityPass and (not requireRetestRejection or bullishStrongRetestRejection)
+bool bearishRetestConfirmationCandidate = barstate.isconfirmed and bearishRetestContext and retestWindowValid and not retestFailed and not retestConfirmed and not bearishRetestFailureThresholdReached and bearishModePass and bearishRetestQualityPass and (not requireRetestRejection or bearishStrongRetestRejection)
 float fastEmaValue = ta.ema(close, fastEmaLength)
 float slowEmaValue = ta.ema(close, slowEmaLength)
 [htfFastEmaValue, htfSlowEmaValue] = request.security(syminfo.tickerid, htfTimeframe, [ta.ema(close, fastEmaLength), ta.ema(close, slowEmaLength)], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
@@ -794,6 +945,25 @@ if barstate.isconfirmed
         breakoutStrength := BreakoutStrength.Weak
         bullishFailureCount := 0
         bearishFailureCount := 0
+        retestState := RetestState.None
+        retestLevel := na
+        retestScore := na
+        retestBarIndex := na
+        retestStartBarIndex := na
+        retestStartTime := na
+        retestTradeDirection := TradeDirection.None
+        retestDistance := na
+        retestDistanceATR := na
+        retestPenetration := na
+        retestPenetrationATR := na
+        retestBarsSinceBreakout := na
+        retestAttempted := false
+        retestConfirmed := false
+        retestFailed := false
+        bullishRetestFailureCount := 0
+        bearishRetestFailureCount := 0
+        retestAttemptCount := 0
+        retestRetryPending := false
     if enabled and symbolMatches and sessionState.isActive
         [calculatedRangeState, calculatedAtrAtCompletion, calculatedRangeBreakoutState] = CalculateOpeningRange(rangeState, atrValue)
         rangeState := calculatedRangeState
@@ -855,6 +1025,126 @@ if barstate.isconfirmed
             breakoutConfirmed := false
             breakoutFailed := true
             bearishBreakoutFailure := true
+    if bullishBreakoutSignal != bearishBreakoutSignal
+        retestState := RetestState.WaitingForRetest
+        retestTradeDirection := bullishBreakoutSignal ? TradeDirection.Long : TradeDirection.Short
+        retestLevel := bullishBreakoutSignal ? rangeState.high : rangeState.low
+        retestStartBarIndex := bar_index
+        retestStartTime := time
+        retestBarIndex := na
+        retestDistance := na
+        retestDistanceATR := na
+        retestPenetration := na
+        retestPenetrationATR := na
+        retestBarsSinceBreakout := 0
+        retestAttempted := false
+        retestConfirmed := false
+        retestFailed := false
+        bullishRetestFailureCount := 0
+        bearishRetestFailureCount := 0
+        retestAttemptCount := 0
+        retestRetryPending := false
+    bool matchingBreakoutFailure = (retestTradeDirection == TradeDirection.Long and (bullishBreakoutFailure or breakoutState == BreakoutState.BullishFailed)) or (retestTradeDirection == TradeDirection.Short and (bearishBreakoutFailure or breakoutState == BreakoutState.BearishFailed))
+    bool retestLifecycleActive = retestState == RetestState.WaitingForRetest or retestState == RetestState.RetestDetected or (retestState == RetestState.RetestFailed and retestRetryPending)
+    bool retestFailureTransition = false
+    if retestLifecycleActive and not retestConfirmed and matchingBreakoutFailure
+        retestState := RetestState.RetestFailed
+        retestFailed := true
+        retestConfirmed := false
+        retestRetryPending := false
+        retestRetryEligible := false
+    else if retestLifecycleActive and not retestConfirmed and not retestWindowValid
+        retestState := RetestState.Expired
+        retestConfirmed := false
+        retestFailed := false
+        retestRetryPending := false
+        retestRetryEligible := false
+    else if retestState == RetestState.RetestFailed and retestRetryPending and retestRetryEligible
+        retestState := RetestState.WaitingForRetest
+        retestFailed := false
+        retestConfirmed := false
+        retestRetryPending := false
+        retestRetryEligible := false
+        retestBarIndex := na
+        retestDistance := na
+        retestDistanceATR := na
+        retestPenetration := na
+        retestPenetrationATR := na
+        bullishRetestFailureCount := 0
+        bearishRetestFailureCount := 0
+    if retestActive and (retestState == RetestState.WaitingForRetest or retestState == RetestState.RetestDetected)
+        retestBarsSinceBreakout := bar_index - retestStartBarIndex
+        retestDistance := math.abs(close - retestLevel)
+        retestDistanceATR := SafeDivide(retestDistance, atrValue, na)
+        retestPenetration := retestTradeDirection == TradeDirection.Long ? math.max(retestLevel - low, 0.0) : math.max(high - retestLevel, 0.0)
+        retestPenetrationATR := SafeDivide(retestPenetration, atrValue, na)
+        if (retestTradeDirection == TradeDirection.Long and low < retestLevel - maximumRetestPenetration) or (retestTradeDirection == TradeDirection.Short and high > retestLevel + maximumRetestPenetration)
+            retestState := RetestState.RetestFailed
+            retestFailed := true
+            retestFailureTransition := true
+        else if retestState == RetestState.WaitingForRetest and (bullishRetestInteraction or bearishRetestInteraction)
+            retestState := RetestState.RetestDetected
+            retestAttempted := true
+            retestAttemptCount += 1
+            retestBarIndex := bar_index
+            bullishRetestDetected := bullishRetestInteraction
+            bearishRetestDetected := bearishRetestInteraction
+    if retestState == RetestState.RetestDetected and not retestConfirmed
+        if retestTradeDirection == TradeDirection.Long
+            bullishRetestFailureCount := bullishRetestCloseFailure ? bullishRetestFailureCount + 1 : 0
+            bearishRetestFailureCount := 0
+        else if retestTradeDirection == TradeDirection.Short
+            bearishRetestFailureCount := bearishRetestCloseFailure ? bearishRetestFailureCount + 1 : 0
+            bullishRetestFailureCount := 0
+        else
+            bullishRetestFailureCount := 0
+            bearishRetestFailureCount := 0
+    else
+        bullishRetestFailureCount := 0
+        bearishRetestFailureCount := 0
+    if bullishRetestFailureThresholdReached and retestTradeDirection == TradeDirection.Long and retestState == RetestState.RetestDetected and not retestConfirmed and barstate.isconfirmed
+        bullishRetestFailure := true
+        bearishRetestFailure := false
+        retestState := RetestState.RetestFailed
+        retestFailed := true
+        retestConfirmed := false
+        retestFailureTransition := true
+        bullishRetestFailureCount := 0
+        bearishRetestFailureCount := 0
+    else if bearishRetestFailureThresholdReached and retestTradeDirection == TradeDirection.Short and retestState == RetestState.RetestDetected and not retestConfirmed and barstate.isconfirmed
+        bearishRetestFailure := true
+        bullishRetestFailure := false
+        retestState := RetestState.RetestFailed
+        retestFailed := true
+        retestConfirmed := false
+        retestFailureTransition := true
+        bullishRetestFailureCount := 0
+        bearishRetestFailureCount := 0
+    if retestFailureTransition
+        retestRetryEligible := allowMultipleRetestAttempts and not retestConfirmed and not matchingBreakoutFailure and retestWindowValid
+        if retestRetryEligible
+            retestRetryPending := true
+    if (retestState == RetestState.WaitingForRetest or retestState == RetestState.RetestDetected) and bullishRetestConfirmationCandidate != bearishRetestConfirmationCandidate
+        if bullishRetestConfirmationCandidate
+            retestState := RetestState.RetestConfirmed
+            retestConfirmed := true
+            retestFailed := false
+            retestRetryPending := false
+            retestRetryEligible := false
+            retestTradeDirection := TradeDirection.Long
+            retestScore := bullishRetestScore
+            retestBarIndex := bar_index
+            bullishRetestConfirmed := true
+        else if bearishRetestConfirmationCandidate
+            retestState := RetestState.RetestConfirmed
+            retestConfirmed := true
+            retestFailed := false
+            retestRetryPending := false
+            retestRetryEligible := false
+            retestTradeDirection := TradeDirection.Short
+            retestScore := bearishRetestScore
+            retestBarIndex := bar_index
+            bearishRetestConfirmed := true
     if not sessionState.isActive and not breakoutConfirmed and not breakoutFailed
         breakoutState := BreakoutState.Invalidated
     else if rangeState.isComplete and not breakoutWindowValid and not breakoutConfirmed and not breakoutFailed
@@ -884,3 +1174,12 @@ plotshape(showBreakoutMarkers and bearishBreakoutSignal, "Bearish Breakout", sha
 plotshape(showBreakoutMarkers and bullishBreakoutFailure, "Bullish Breakout Failure", shape.xcross, location.abovebar, color.orange, size = size.tiny)
 plotshape(showBreakoutMarkers and bearishBreakoutFailure, "Bearish Breakout Failure", shape.xcross, location.belowbar, color.orange, size = size.tiny)
 plotchar(showBreakoutScore and (bullishBreakoutSignal or bearishBreakoutSignal) ? breakoutScore : na, "Breakout Score", "•", location.top, color = color.white)
+bool retestLevelVisible = retestState != RetestState.None and not na(retestLevel)
+plot(showRetestLevel and retestLevelVisible ? retestLevel : na, "Retest Level", color = retestTradeDirection == TradeDirection.Long ? color.aqua : retestTradeDirection == TradeDirection.Short ? color.fuchsia : color.gray, linewidth = 2, style = plot.style_linebr)
+plotshape(showRetestMarkers and bullishRetestDetected, "Bullish Retest Detected", shape.circle, location.belowbar, color.aqua, size = size.tiny)
+plotshape(showRetestMarkers and bearishRetestDetected, "Bearish Retest Detected", shape.circle, location.abovebar, color.fuchsia, size = size.tiny)
+plotshape(showRetestMarkers and bullishRetestConfirmed, "Bullish Retest Confirmed", shape.diamond, location.belowbar, color.lime, size = size.small)
+plotshape(showRetestMarkers and bearishRetestConfirmed, "Bearish Retest Confirmed", shape.diamond, location.abovebar, color.red, size = size.small)
+plotshape(showRetestMarkers and bullishRetestFailure, "Bullish Retest Failure", shape.xcross, location.abovebar, color.orange, size = size.small)
+plotshape(showRetestMarkers and bearishRetestFailure, "Bearish Retest Failure", shape.xcross, location.belowbar, color.orange, size = size.small)
+plotchar(showRetestScore and (bullishRetestConfirmed or bearishRetestConfirmed) ? retestScore : na, "Retest Score", "R", location.bottom, color = color.white)
