@@ -1,11 +1,14 @@
 //@version=6
 // XAUUSD Institutional Framework
-// Version: 0.7.0
+// Version: 0.8.0
 //
 // Session and Opening Range engine. Every state mutation happens on confirmed
 // bars, so the engine never uses future values or repainting calculations.
 //
 // Changelog:
+// - 0.8.0: Added M8-A initial stop-selection architecture and fixed initial
+//          risk-distance context, fixed position sizing, fixed-R targets/RR
+//          validation, and guarded final risk approval with dashboard support.
 // - 0.7.0: Added M7 directional component scoring, mandatory setup gates,
 //          bounded penalties and adjusted scores, final directional
 //          qualification/conflict resolution, setup lifecycle, and visuals.
@@ -27,7 +30,7 @@
 //============================================================================== 
 // 1. STRATEGY DECLARATION
 //============================================================================== 
-strategy("XAUUSD Institutional Framework v0.7.0", "XAUUSD v0.7.0", overlay = true,
+strategy("XAUUSD Institutional Framework v0.8.0", "XAUUSD v0.8.0", overlay = true,
      pyramiding = 0, calc_on_every_tick = false, calc_on_order_fills = false,
      process_orders_on_close = true, initial_capital = 10000, currency = currency.USD,
      default_qty_type = strategy.percent_of_equity, default_qty_value = 1)
@@ -35,7 +38,7 @@ strategy("XAUUSD Institutional Framework v0.7.0", "XAUUSD v0.7.0", overlay = tru
 //============================================================================== 
 // 2. CONSTANTS AND ENUMS
 //============================================================================== 
-string STRATEGY_VERSION = "0.7.0"
+string STRATEGY_VERSION = "0.8.0"
 string DASHBOARD_TITLE = "XAUUSD SESSION ENGINE"
 int MILLISECONDS_PER_MINUTE = 60000
 int ATR_LENGTH = 14
@@ -201,6 +204,44 @@ enum TradeSetupStrength
     Strong
     Extreme
 
+// M8 stop-selection policy for the initial, fixed stop-loss reference.
+enum StopLossMode
+    ATR
+    Swing
+    OpeningRange
+    RetestStructure
+    Conservative
+
+// M8 diagnostic source for the selected initial stop-loss reference.
+enum StopSource
+    None
+    ATR
+    Swing
+    OpeningRange
+    Retest
+    Conservative
+
+// M8-B position-size policy. Quantity is always a positive magnitude.
+enum PositionSizingMode
+    RiskPercent
+    FixedCashRisk
+    FixedQuantity
+
+// M8-B source for the equity captured with an initial risk context.
+enum AccountEquitySource
+    DynamicStrategyEquity
+    InitialCapital
+
+// M8-D deterministic diagnostic for final approval guard failures.
+enum RiskBlockReason
+    None
+    DailyRisk
+    DailyLoss
+    TradeCount
+    ConsecutiveLosses
+    SessionRisk
+    Multiple
+
 //============================================================================== 
 // 3. INPUTS
 //============================================================================== 
@@ -224,6 +265,7 @@ string GROUP_PREMIUM_DISCOUNT = "17. Premium / Discount"
 string GROUP_SMART_MONEY_SCORE = "18. Smart Money Score"
 string GROUP_TRADE_SCORING = "19. Trade Scoring Engine"
 string GROUP_TRADE_SCORING_VISUALS = "20. Trade Scoring Visuals"
+string GROUP_RISK_MANAGEMENT = "21. M8 — Risk Management"
 
 bool enabled = input.bool(true, "Enable strategy", group = GROUP_GENERAL)
 string expectedSymbol = input.string("XAUUSD", "Expected symbol", group = GROUP_GENERAL)
@@ -380,6 +422,35 @@ bool showQualifiedSetupMarkers = input.bool(true, "Show qualified setup markers"
 bool showSetupScore = input.bool(true, "Show setup score", group = GROUP_TRADE_SCORING_VISUALS)
 bool showTradeBiasBackground = input.bool(false, "Show trade bias background", group = GROUP_TRADE_SCORING_VISUALS)
 bool showRawVsAdjustedScore = input.bool(true, "Show raw vs adjusted score", group = GROUP_TRADE_SCORING_VISUALS)
+bool riskEngineEnabled = input.bool(true, "Enable Risk Engine", group = GROUP_RISK_MANAGEMENT)
+StopLossMode stopLossMode = input.enum(StopLossMode.RetestStructure, "Stop Loss Mode", group = GROUP_RISK_MANAGEMENT)
+float atrStopMultiplier = input.float(1.5, "ATR Stop Multiplier", minval = 0.0, group = GROUP_RISK_MANAGEMENT)
+float swingStopBufferTicks = input.float(10.0, "Swing Stop Buffer (ticks)", minval = 0.0, group = GROUP_RISK_MANAGEMENT)
+float rangeStopBufferTicks = input.float(10.0, "Range Stop Buffer (ticks)", minval = 0.0, group = GROUP_RISK_MANAGEMENT)
+float minimumStopDistanceAtr = input.float(0.25, "Minimum Stop Distance ATR", minval = 0.0, group = GROUP_RISK_MANAGEMENT)
+float maximumStopDistanceAtr = input.float(5.0, "Maximum Stop Distance ATR", minval = 0.0, group = GROUP_RISK_MANAGEMENT)
+PositionSizingMode positionSizingMode = input.enum(PositionSizingMode.RiskPercent, "Position Sizing Mode", group = GROUP_RISK_MANAGEMENT)
+float riskPerTradePercent = input.float(1.0, "Risk Per Trade %", minval = 0.1, maxval = 5.0, group = GROUP_RISK_MANAGEMENT)
+float fixedCashRisk = input.float(100.0, "Fixed Cash Risk", minval = 0.0, group = GROUP_RISK_MANAGEMENT)
+float fixedQuantity = input.float(1.0, "Fixed Quantity", minval = 0.0, group = GROUP_RISK_MANAGEMENT)
+float minimumPositionQuantity = input.float(0.01, "Minimum Quantity", minval = 0.0, group = GROUP_RISK_MANAGEMENT)
+float maximumPositionQuantity = input.float(1000.0, "Maximum Quantity", minval = 0.0, group = GROUP_RISK_MANAGEMENT)
+float quantityStep = input.float(0.01, "Quantity Step", minval = 0.0, group = GROUP_RISK_MANAGEMENT)
+AccountEquitySource accountEquitySource = input.enum(AccountEquitySource.DynamicStrategyEquity, "Account Equity Source", group = GROUP_RISK_MANAGEMENT)
+float maximumAllowedRiskPercent = input.float(2.0, "Maximum Allowed Risk %", minval = 0.0, group = GROUP_RISK_MANAGEMENT)
+float tp1RMultiple = input.float(1.0, "TP1 R Multiple", minval = 0.0, group = GROUP_RISK_MANAGEMENT)
+float tp2RMultiple = input.float(2.5, "TP2 R Multiple", minval = 0.0, group = GROUP_RISK_MANAGEMENT)
+float minimumRequiredRr = input.float(1.5, "Minimum Required RR", minval = 0.0, group = GROUP_RISK_MANAGEMENT)
+bool requireTp2RrValidation = input.bool(true, "Require TP2 RR Validation", group = GROUP_RISK_MANAGEMENT)
+bool finalRiskApprovalEnabled = input.bool(true, "Enable Final Risk Approval", group = GROUP_RISK_MANAGEMENT)
+bool dailyRiskGuardEnabled = input.bool(true, "Enable Daily Risk Guard", group = GROUP_RISK_MANAGEMENT)
+float maximumDailyRiskPercent = input.float(3.0, "Maximum Daily Risk %", minval = 0.1, maxval = 10.0, group = GROUP_RISK_MANAGEMENT)
+float maximumDailyLossPercent = input.float(3.0, "Maximum Daily Loss %", minval = 0.1, maxval = 10.0, group = GROUP_RISK_MANAGEMENT)
+int maximumTradesPerDay = input.int(3, "Maximum Trades Per Day", minval = 1, maxval = 20, group = GROUP_RISK_MANAGEMENT)
+int maximumConsecutiveLosses = input.int(2, "Maximum Consecutive Losses", minval = 1, maxval = 20, group = GROUP_RISK_MANAGEMENT)
+bool sessionRiskGuardEnabled = input.bool(true, "Enable Session Risk Guard", group = GROUP_RISK_MANAGEMENT)
+float maximumSessionRiskPercent = input.float(2.0, "Maximum Session Risk %", minval = 0.1, maxval = 10.0, group = GROUP_RISK_MANAGEMENT)
+bool resetGuardsOnNewSession = input.bool(true, "Reset Guards On New Session", group = GROUP_RISK_MANAGEMENT)
 
 //============================================================================== 
 // 4. STATE MODELS
@@ -618,6 +689,61 @@ var bool bearishTradeQualifiedEvent = false
 var int tradeSetupBarIndex = na
 var float tradeSetupScore = na
 var TradeBias tradeSetupDirection = TradeBias.None
+var float riskEntryPrice = na
+var float riskStopPrice = na
+var float riskDistance = na
+var float riskDistanceATR = na
+var StopSource riskStopSource = StopSource.None
+var TradeBias riskDirection = TradeBias.None
+var int riskSetupBarIndex = na
+var bool riskContextActive = false
+var float riskSizingEquity = na
+var float riskCashAmount = na
+var float riskRawQuantity = na
+var float riskQuantity = na
+var float riskPerUnitStored = na
+var float riskActualCashAmount = na
+var float riskActualPercent = na
+var bool riskPositionRiskWithinLimit = false
+var bool riskSizingValid = false
+var float riskTP1 = na
+var float riskTP2 = na
+var float riskRR1 = na
+var float riskRR2 = na
+var bool riskTargetsValid = false
+var bool riskApprovedStored = false
+var bool baseRiskApproved = false
+var bool riskApproved = false
+var bool bullishBaseRiskApprovedEvent = false
+var bool bearishBaseRiskApprovedEvent = false
+var bool bullishRiskApprovedEvent = false
+var bool bearishRiskApprovedEvent = false
+var float dailyStartEquity = na
+var float dailyPnL = na
+var float dailyPnLPercent = na
+var float dailyAllocatedRisk = 0.0
+var float dailyAllocatedRiskPercent = na
+var int dailyApprovedSetupCount = 0
+var int consecutiveLossCount = 0
+var float sessionStartEquity = na
+var float sessionAllocatedRisk = 0.0
+var float sessionAllocatedRiskPercent = na
+var int sessionApprovedSetupCount = 0
+var bool dailyRiskBudgetAvailable = true
+var bool dailyLossLimitPass = true
+var bool dailyTradeCountPass = true
+var bool consecutiveLossLimitPass = true
+var bool sessionRiskBudgetAvailable = true
+var bool riskGuardPass = true
+var bool blockedByDailyRisk = false
+var bool blockedByDailyLoss = false
+var bool blockedByTradeCount = false
+var bool blockedByConsecutiveLosses = false
+var bool blockedBySessionRisk = false
+var RiskBlockReason riskBlockReason = RiskBlockReason.None
+var string riskDirectionDashboardText = "None"
+var string riskStopSourceDashboardText = "None"
+var string riskBlockReasonDashboardText = "None"
 var bool priceAbovePDH = false
 var bool priceBelowPDL = false
 var bool priceAbovePWH = false
@@ -1082,7 +1208,7 @@ CalculateTrendLabel(label previousLabel) =>
 //============================================================================== 
 // 11. DASHBOARD AND DEBUG
 //============================================================================== 
-var table dashboard = table.new(position.top_right, 2, 67, border_width = 1)
+var table dashboard = table.new(position.top_right, 2, 92, border_width = 1)
 var table debugTable = table.new(position.bottom_right, 2, 6, border_width = 1)
 
 // Writes one consistently styled dashboard row.
@@ -1161,8 +1287,33 @@ UpdateDashboard() =>
             SetDashboardRow(dashboard, 64, "Bullish qualified", bullishTradeQualified ? "Yes" : "No")
             SetDashboardRow(dashboard, 65, "Bearish qualified", bearishTradeQualified ? "Yes" : "No")
             SetDashboardRow(dashboard, 66, "Directional score difference", FormatValueOrDash(tradeScoreDifferenceDisplay))
+            SetDashboardRow(dashboard, 67, "Risk context active", riskContextActive ? "Yes" : "No")
+            SetDashboardRow(dashboard, 68, "Risk direction", riskDirectionDashboardText)
+            SetDashboardRow(dashboard, 69, "Risk entry", FormatValueOrDash(riskEntryPrice))
+            SetDashboardRow(dashboard, 70, "Risk stop", FormatValueOrDash(riskStopPrice))
+            SetDashboardRow(dashboard, 71, "Stop source", riskStopSourceDashboardText)
+            SetDashboardRow(dashboard, 72, "Risk distance ATR", FormatValueOrDash(riskDistanceATR))
+            SetDashboardRow(dashboard, 73, "Sizing equity", FormatValueOrDash(riskSizingEquity))
+            SetDashboardRow(dashboard, 74, "Target cash risk", FormatValueOrDash(riskCashAmount))
+            SetDashboardRow(dashboard, 75, "Position quantity", FormatValueOrDash(riskQuantity))
+            SetDashboardRow(dashboard, 76, "Actual cash risk", FormatValueOrDash(riskActualCashAmount))
+            SetDashboardRow(dashboard, 77, "Actual risk %", FormatValueOrDash(riskActualPercent))
+            SetDashboardRow(dashboard, 78, "TP1", FormatValueOrDash(riskTP1))
+            SetDashboardRow(dashboard, 79, "TP2", FormatValueOrDash(riskTP2))
+            SetDashboardRow(dashboard, 80, "RR1", FormatValueOrDash(riskRR1))
+            SetDashboardRow(dashboard, 81, "RR2", FormatValueOrDash(riskRR2))
+            SetDashboardRow(dashboard, 82, "Base risk approved", baseRiskApproved ? "Yes" : "No")
+            SetDashboardRow(dashboard, 83, "Final risk approved", riskApproved ? "Yes" : "No")
+            SetDashboardRow(dashboard, 84, "Daily allocated risk %", FormatValueOrDash(dailyAllocatedRiskPercent))
+            SetDashboardRow(dashboard, 85, "Daily P/L %", FormatValueOrDash(dailyPnLPercent))
+            SetDashboardRow(dashboard, 86, "Daily approved setups", str.tostring(dailyApprovedSetupCount))
+            SetDashboardRow(dashboard, 87, "Session allocated risk %", FormatValueOrDash(sessionAllocatedRiskPercent))
+            SetDashboardRow(dashboard, 88, "Session approved setups", str.tostring(sessionApprovedSetupCount))
+            SetDashboardRow(dashboard, 89, "Consecutive losses", str.tostring(consecutiveLossCount))
+            SetDashboardRow(dashboard, 90, "Risk guard pass", riskGuardPass ? "Yes" : "No")
+            SetDashboardRow(dashboard, 91, "Risk block reason", riskBlockReasonDashboardText)
         else
-            table.clear(dashboard, 0, 0, 1, 66)
+            table.clear(dashboard, 0, 0, 1, 91)
 
 // Updates the diagnostic panel only on the last chart bar when debugging is enabled.
 UpdateDebugPanel() =>
@@ -2062,6 +2213,321 @@ else
 bullishTradeQualified := tradeSetupState == TradeSetupState.BullishQualified
 bearishTradeQualified := tradeSetupState == TradeSetupState.BearishQualified
 tradeSetupStrength := (bullishTradeQualified or bearishTradeQualified) and not na(tradeSetupScore) ? tradeSetupScore >= 90.0 ? TradeSetupStrength.Extreme : tradeSetupScore >= 75.0 ? TradeSetupStrength.Strong : tradeSetupScore >= 60.0 ? TradeSetupStrength.Normal : TradeSetupStrength.Weak : TradeSetupStrength.Weak
+
+//==============================================================================
+// 20. M8-A INITIAL STOP AND RISK-DISTANCE ENGINE
+//==============================================================================
+// M8-A captures an initial context only on a new M7 qualification event. It
+// deliberately does not move stops after capture; dynamic management is M9.
+bool newBullishRiskContext = riskEngineEnabled and bullishTradeQualifiedEvent and tradeSetupDirection == TradeBias.Bullish
+bool newBearishRiskContext = riskEngineEnabled and bearishTradeQualifiedEvent and tradeSetupDirection == TradeBias.Bearish
+bool newRiskContext = newBullishRiskContext or newBearishRiskContext
+TradeBias newRiskDirection = newBullishRiskContext ? TradeBias.Bullish : newBearishRiskContext ? TradeBias.Bearish : TradeBias.None
+float riskEntryCandidate = newRiskContext and barstate.isconfirmed ? close : na
+float swingStopBufferPrice = swingStopBufferTicks * syminfo.mintick
+float rangeStopBufferPrice = rangeStopBufferTicks * syminfo.mintick
+float retestStructureBufferPrice = syminfo.mintick
+
+// Candidate stops use only confirmed state from earlier modules. The retest
+// candidate is placed beyond the actual completed retest penetration, with a
+// one-tick structural buffer, and is valid only inside M5's allowed boundary.
+float bullishAtrStopCandidate = not na(riskEntryCandidate) and not na(atrValue) ? riskEntryCandidate - atrValue * atrStopMultiplier : na
+float bearishAtrStopCandidate = not na(riskEntryCandidate) and not na(atrValue) ? riskEntryCandidate + atrValue * atrStopMultiplier : na
+float bullishSwingStopCandidate = not na(riskEntryCandidate) and not na(trendState.swingLow) ? trendState.swingLow - swingStopBufferPrice : na
+float bearishSwingStopCandidate = not na(riskEntryCandidate) and not na(trendState.swingHigh) ? trendState.swingHigh + swingStopBufferPrice : na
+float bullishRangeStopCandidate = not na(riskEntryCandidate) and rangeState.isComplete and rangeState.qualityAccepted and not na(rangeState.low) ? rangeState.low - rangeStopBufferPrice : na
+float bearishRangeStopCandidate = not na(riskEntryCandidate) and rangeState.isComplete and rangeState.qualityAccepted and not na(rangeState.high) ? rangeState.high + rangeStopBufferPrice : na
+bool bullishRetestStructureValid = retestTradeDirection == TradeDirection.Long and retestState == RetestState.RetestConfirmed and not na(retestLevel) and not na(retestPenetration) and not na(maximumRetestPenetration) and retestPenetration >= 0.0 and retestPenetration <= maximumRetestPenetration
+bool bearishRetestStructureValid = retestTradeDirection == TradeDirection.Short and retestState == RetestState.RetestConfirmed and not na(retestLevel) and not na(retestPenetration) and not na(maximumRetestPenetration) and retestPenetration >= 0.0 and retestPenetration <= maximumRetestPenetration
+float bullishRetestStopCandidate = not na(riskEntryCandidate) and bullishRetestStructureValid ? retestLevel - retestPenetration - retestStructureBufferPrice : na
+float bearishRetestStopCandidate = not na(riskEntryCandidate) and bearishRetestStructureValid ? retestLevel + retestPenetration + retestStructureBufferPrice : na
+bool bullishAtrStopValid = not na(bullishAtrStopCandidate) and not na(riskEntryCandidate) and bullishAtrStopCandidate < riskEntryCandidate
+bool bearishAtrStopValid = not na(bearishAtrStopCandidate) and not na(riskEntryCandidate) and bearishAtrStopCandidate > riskEntryCandidate
+bool bullishSwingStopValid = not na(bullishSwingStopCandidate) and not na(riskEntryCandidate) and bullishSwingStopCandidate < riskEntryCandidate
+bool bearishSwingStopValid = not na(bearishSwingStopCandidate) and not na(riskEntryCandidate) and bearishSwingStopCandidate > riskEntryCandidate
+bool bullishRangeStopValid = not na(bullishRangeStopCandidate) and not na(riskEntryCandidate) and bullishRangeStopCandidate < riskEntryCandidate
+bool bearishRangeStopValid = not na(bearishRangeStopCandidate) and not na(riskEntryCandidate) and bearishRangeStopCandidate > riskEntryCandidate
+bool bullishRetestStopValid = not na(bullishRetestStopCandidate) and not na(riskEntryCandidate) and bullishRetestStopCandidate < riskEntryCandidate
+bool bearishRetestStopValid = not na(bearishRetestStopCandidate) and not na(riskEntryCandidate) and bearishRetestStopCandidate > riskEntryCandidate
+
+// Conservative selection chooses the furthest directionally-valid structural
+// stop: the lowest long stop or highest short stop. Invalid/na candidates are
+// excluded before comparison.
+float bullishConservativeStopCandidate = na
+if bullishAtrStopValid
+    bullishConservativeStopCandidate := bullishAtrStopCandidate
+if bullishSwingStopValid
+    bullishConservativeStopCandidate := na(bullishConservativeStopCandidate) ? bullishSwingStopCandidate : math.min(bullishConservativeStopCandidate, bullishSwingStopCandidate)
+if bullishRangeStopValid
+    bullishConservativeStopCandidate := na(bullishConservativeStopCandidate) ? bullishRangeStopCandidate : math.min(bullishConservativeStopCandidate, bullishRangeStopCandidate)
+if bullishRetestStopValid
+    bullishConservativeStopCandidate := na(bullishConservativeStopCandidate) ? bullishRetestStopCandidate : math.min(bullishConservativeStopCandidate, bullishRetestStopCandidate)
+float bearishConservativeStopCandidate = na
+if bearishAtrStopValid
+    bearishConservativeStopCandidate := bearishAtrStopCandidate
+if bearishSwingStopValid
+    bearishConservativeStopCandidate := na(bearishConservativeStopCandidate) ? bearishSwingStopCandidate : math.max(bearishConservativeStopCandidate, bearishSwingStopCandidate)
+if bearishRangeStopValid
+    bearishConservativeStopCandidate := na(bearishConservativeStopCandidate) ? bearishRangeStopCandidate : math.max(bearishConservativeStopCandidate, bearishRangeStopCandidate)
+if bearishRetestStopValid
+    bearishConservativeStopCandidate := na(bearishConservativeStopCandidate) ? bearishRetestStopCandidate : math.max(bearishConservativeStopCandidate, bearishRetestStopCandidate)
+
+float selectedRiskStopCandidate = na
+StopSource selectedRiskStopSource = StopSource.None
+if newBullishRiskContext
+    if stopLossMode == StopLossMode.ATR
+        selectedRiskStopCandidate := bullishAtrStopCandidate
+        selectedRiskStopSource := StopSource.ATR
+    else if stopLossMode == StopLossMode.Swing
+        selectedRiskStopCandidate := bullishSwingStopCandidate
+        selectedRiskStopSource := StopSource.Swing
+    else if stopLossMode == StopLossMode.OpeningRange
+        selectedRiskStopCandidate := bullishRangeStopCandidate
+        selectedRiskStopSource := StopSource.OpeningRange
+    else if stopLossMode == StopLossMode.RetestStructure
+        selectedRiskStopCandidate := bullishRetestStopCandidate
+        selectedRiskStopSource := StopSource.Retest
+    else
+        selectedRiskStopCandidate := bullishConservativeStopCandidate
+        selectedRiskStopSource := StopSource.Conservative
+else if newBearishRiskContext
+    if stopLossMode == StopLossMode.ATR
+        selectedRiskStopCandidate := bearishAtrStopCandidate
+        selectedRiskStopSource := StopSource.ATR
+    else if stopLossMode == StopLossMode.Swing
+        selectedRiskStopCandidate := bearishSwingStopCandidate
+        selectedRiskStopSource := StopSource.Swing
+    else if stopLossMode == StopLossMode.OpeningRange
+        selectedRiskStopCandidate := bearishRangeStopCandidate
+        selectedRiskStopSource := StopSource.OpeningRange
+    else if stopLossMode == StopLossMode.RetestStructure
+        selectedRiskStopCandidate := bearishRetestStopCandidate
+        selectedRiskStopSource := StopSource.Retest
+    else
+        selectedRiskStopCandidate := bearishConservativeStopCandidate
+        selectedRiskStopSource := StopSource.Conservative
+bool selectedRiskStopValid = newRiskDirection == TradeBias.Bullish ? not na(selectedRiskStopCandidate) and selectedRiskStopCandidate < riskEntryCandidate : newRiskDirection == TradeBias.Bearish ? not na(selectedRiskStopCandidate) and selectedRiskStopCandidate > riskEntryCandidate : false
+float selectedRiskDistance = selectedRiskStopValid ? newRiskDirection == TradeBias.Bullish ? riskEntryCandidate - selectedRiskStopCandidate : selectedRiskStopCandidate - riskEntryCandidate : na
+float selectedRiskDistanceATR = selectedRiskStopValid ? SafeDivide(selectedRiskDistance, atrValue, na) : na
+
+// Risk context is reset only by M2/M7 lifecycle boundaries or when disabled;
+// a later M7 event overwrites it as a new initial-risk context.
+bool riskContextResetRequired = not riskEngineEnabled or sessionState.justStarted or tradeSetupState == TradeSetupState.Disqualified or tradeSetupState == TradeSetupState.Expired or not (bullishTradeQualified or bearishTradeQualified)
+if riskContextResetRequired
+    riskEntryPrice := na
+    riskStopPrice := na
+    riskDistance := na
+    riskDistanceATR := na
+    riskStopSource := StopSource.None
+    riskDirection := TradeBias.None
+    riskSetupBarIndex := na
+    riskContextActive := false
+else if newRiskContext
+    riskEntryPrice := riskEntryCandidate
+    riskStopPrice := selectedRiskStopValid ? selectedRiskStopCandidate : na
+    riskDistance := selectedRiskDistance
+    riskDistanceATR := selectedRiskDistanceATR
+    riskStopSource := selectedRiskStopValid ? selectedRiskStopSource : StopSource.None
+    riskDirection := newRiskDirection
+    riskSetupBarIndex := bar_index
+    riskContextActive := true
+
+// Exposed M8-A outputs mirror the fixed context and are inactive outside an
+// M7-qualified setup. Stop-distance validation is diagnostic only in M8-A.
+float proposedEntryPrice = riskContextActive ? riskEntryPrice : na
+float proposedStopPrice = riskContextActive ? riskStopPrice : na
+bool proposedStopValid = riskContextActive and not na(proposedEntryPrice) and not na(proposedStopPrice) and (riskDirection == TradeBias.Bullish ? proposedStopPrice < proposedEntryPrice : riskDirection == TradeBias.Bearish ? proposedStopPrice > proposedEntryPrice : false)
+float proposedRiskDistance = proposedStopValid ? riskDistance : na
+float proposedRiskDistanceATR = proposedStopValid ? riskDistanceATR : na
+bool stopDistanceValid = proposedStopValid and not na(proposedRiskDistance) and proposedRiskDistance > 0.0 and not na(proposedRiskDistanceATR) and minimumStopDistanceAtr <= maximumStopDistanceAtr and proposedRiskDistanceATR >= minimumStopDistanceAtr and proposedRiskDistanceATR <= maximumStopDistanceAtr
+StopSource stopSource = riskContextActive ? riskStopSource : StopSource.None
+
+//==============================================================================
+// 21. M8-B FIXED RISK-BASED POSITION SIZING
+//==============================================================================
+// TradingView quantity and point-value semantics depend on the selected XAUUSD
+// data feed/broker symbol. This quantity is valid for TradingView strategy
+// economics using syminfo.pointvalue; live broker lot conversion must be
+// verified separately before automation. No ounces-per-lot assumption is made.
+float sizingEquityCandidate = accountEquitySource == AccountEquitySource.DynamicStrategyEquity ? strategy.equity : strategy.initial_capital
+bool sizingEquityCandidateValid = not na(sizingEquityCandidate) and sizingEquityCandidate > 0.0
+float riskPerUnitCandidate = riskContextActive and not na(riskDistance) and riskDistance > 0.0 and not na(syminfo.pointvalue) and syminfo.pointvalue > 0.0 ? riskDistance * syminfo.pointvalue : na
+bool riskPerUnitCandidateValid = not na(riskPerUnitCandidate) and riskPerUnitCandidate > 0.0
+float cashRiskTargetCandidate = positionSizingMode == PositionSizingMode.RiskPercent and sizingEquityCandidateValid ? sizingEquityCandidate * riskPerTradePercent * 0.01 : positionSizingMode == PositionSizingMode.FixedCashRisk ? fixedCashRisk : na
+bool cashRiskTargetCandidateValid = not na(cashRiskTargetCandidate) and cashRiskTargetCandidate >= 0.0
+float rawQuantityCandidate = positionSizingMode == PositionSizingMode.FixedQuantity ? fixedQuantity : cashRiskTargetCandidateValid and riskPerUnitCandidateValid ? SafeDivide(cashRiskTargetCandidate, riskPerUnitCandidate, na) : na
+bool quantityStepValid = quantityStep > 0.0
+float normalizedQuantityCandidate = not na(rawQuantityCandidate) and rawQuantityCandidate > 0.0 and quantityStepValid ? math.floor(rawQuantityCandidate / quantityStep) * quantityStep : na
+float maximumNormalizedQuantity = quantityStepValid and maximumPositionQuantity > 0.0 ? math.floor(maximumPositionQuantity / quantityStep) * quantityStep : na
+float cappedQuantityCandidate = not na(normalizedQuantityCandidate) and not na(maximumNormalizedQuantity) and normalizedQuantityCandidate > maximumPositionQuantity ? maximumNormalizedQuantity : normalizedQuantityCandidate
+bool quantityWithinBoundsCandidate = not na(cappedQuantityCandidate) and cappedQuantityCandidate > 0.0 and cappedQuantityCandidate >= minimumPositionQuantity and cappedQuantityCandidate <= maximumPositionQuantity and not na(maximumNormalizedQuantity) and maximumNormalizedQuantity >= minimumPositionQuantity
+float actualCashRiskCandidate = quantityWithinBoundsCandidate and riskPerUnitCandidateValid ? cappedQuantityCandidate * riskPerUnitCandidate : na
+float actualRiskPercentCandidate = not na(actualCashRiskCandidate) and sizingEquityCandidateValid ? actualCashRiskCandidate * 100.0 / sizingEquityCandidate : na
+float cashRiskToleranceCandidate = cashRiskTargetCandidateValid ? math.max(0.000001, cashRiskTargetCandidate * 0.000001) : na
+bool riskBasedMode = positionSizingMode == PositionSizingMode.RiskPercent or positionSizingMode == PositionSizingMode.FixedCashRisk
+bool positionRiskWithinLimitCandidate = riskBasedMode ? not na(actualCashRiskCandidate) and cashRiskTargetCandidateValid and actualCashRiskCandidate <= cashRiskTargetCandidate + cashRiskToleranceCandidate : positionSizingMode == PositionSizingMode.FixedQuantity
+bool fixedQuantityRiskWithinLimit = positionSizingMode != PositionSizingMode.FixedQuantity or not na(actualRiskPercentCandidate) and actualRiskPercentCandidate <= maximumAllowedRiskPercent
+bool positionSizingValidCandidate = riskEngineEnabled and newRiskContext and riskContextActive and proposedStopValid and stopDistanceValid and riskPerUnitCandidateValid and sizingEquityCandidateValid and quantityStepValid and quantityWithinBoundsCandidate and not na(actualCashRiskCandidate) and actualCashRiskCandidate >= 0.0 and positionRiskWithinLimitCandidate and fixedQuantityRiskWithinLimit
+
+// Sizing state shares M8-A's lifecycle and is captured only once for each new
+// setup. A quantity below the configured minimum is rejected, never raised;
+// a quantity above the maximum is capped only after rounding down, reducing risk.
+bool sizingContextResetRequired = riskContextResetRequired or not riskContextActive
+if sizingContextResetRequired
+    riskSizingEquity := na
+    riskCashAmount := na
+    riskRawQuantity := na
+    riskQuantity := na
+    riskPerUnitStored := na
+    riskActualCashAmount := na
+    riskActualPercent := na
+    riskPositionRiskWithinLimit := false
+    riskSizingValid := false
+else if newRiskContext
+    riskSizingEquity := sizingEquityCandidateValid ? sizingEquityCandidate : na
+    riskCashAmount := positionSizingMode == PositionSizingMode.FixedQuantity ? actualCashRiskCandidate : cashRiskTargetCandidate
+    riskRawQuantity := rawQuantityCandidate
+    riskQuantity := quantityWithinBoundsCandidate ? cappedQuantityCandidate : na
+    riskPerUnitStored := riskPerUnitCandidate
+    riskActualCashAmount := actualCashRiskCandidate
+    riskActualPercent := actualRiskPercentCandidate
+    riskPositionRiskWithinLimit := positionRiskWithinLimitCandidate
+    riskSizingValid := positionSizingValidCandidate
+
+// Exposed outputs mirror the frozen sizing context; they never resize solely
+// because strategy.equity or the current ATR changes after qualification.
+float sizingEquity = riskContextActive ? riskSizingEquity : na
+float proposedCashRisk = riskContextActive ? riskCashAmount : na
+float riskPerUnit = riskContextActive ? riskPerUnitStored : na
+float rawPositionQuantity = riskContextActive ? riskRawQuantity : na
+float proposedPositionQuantity = riskContextActive ? riskQuantity : na
+float actualCashRisk = riskContextActive ? riskActualCashAmount : na
+float actualRiskPercent = riskContextActive ? riskActualPercent : na
+bool positionRiskWithinLimit = riskContextActive and riskPositionRiskWithinLimit
+bool positionSizingValid = riskContextActive and riskSizingValid
+
+//==============================================================================
+// 22. M8-C PROJECTED TARGETS, RR, AND FINAL RISK APPROVAL
+//==============================================================================
+// M8-C intentionally supports deterministic fixed-R targets only. Structural
+// target selection and post-entry target management remain M9 responsibilities.
+bool targetContextValid = riskContextActive and proposedStopValid and stopDistanceValid and not na(riskEntryPrice) and not na(riskStopPrice) and not na(riskDistance) and riskDistance > 0.0 and (riskDirection == TradeBias.Bullish or riskDirection == TradeBias.Bearish)
+float tp1Candidate = newRiskContext and targetContextValid and tp1RMultiple > 0.0 ? riskDirection == TradeBias.Bullish ? riskEntryPrice + riskDistance * tp1RMultiple : riskEntryPrice - riskDistance * tp1RMultiple : na
+float tp2Candidate = newRiskContext and targetContextValid and tp2RMultiple > 0.0 ? riskDirection == TradeBias.Bullish ? riskEntryPrice + riskDistance * tp2RMultiple : riskEntryPrice - riskDistance * tp2RMultiple : na
+bool tp1CandidateValid = targetContextValid and not na(tp1Candidate) and (riskDirection == TradeBias.Bullish ? tp1Candidate > riskEntryPrice : tp1Candidate < riskEntryPrice)
+bool tp2CandidateValid = targetContextValid and not na(tp2Candidate) and (riskDirection == TradeBias.Bullish ? tp2Candidate > riskEntryPrice : tp2Candidate < riskEntryPrice)
+float rr1Candidate = tp1CandidateValid ? math.max(0.0, SafeDivide(math.abs(tp1Candidate - riskEntryPrice), riskDistance, na)) : na
+float rr2Candidate = tp2CandidateValid ? math.max(0.0, SafeDivide(math.abs(tp2Candidate - riskEntryPrice), riskDistance, na)) : na
+bool rr1CandidatePass = not na(rr1Candidate) and rr1Candidate >= minimumRequiredRr
+bool rr2CandidatePass = not na(rr2Candidate) and rr2Candidate >= minimumRequiredRr
+bool targetOrderingCandidateValid = tp1CandidateValid and tp2CandidateValid and (riskDirection == TradeBias.Bullish ? tp2Candidate > tp1Candidate and tp1Candidate > riskEntryPrice and riskEntryPrice > riskStopPrice : tp2Candidate < tp1Candidate and tp1Candidate < riskEntryPrice and riskEntryPrice < riskStopPrice)
+bool requiredRrCandidatePass = requireTp2RrValidation ? rr2CandidatePass : rr1CandidatePass
+bool m7RiskDirectionMatches = riskDirection == TradeBias.Bullish ? bullishTradeQualified and tradeSetupDirection == TradeBias.Bullish : riskDirection == TradeBias.Bearish ? bearishTradeQualified and tradeSetupDirection == TradeBias.Bearish : false
+bool baseRiskApprovalCandidate = finalRiskApprovalEnabled and riskEngineEnabled and newRiskContext and targetOrderingCandidateValid and requiredRrCandidatePass and riskSizingValid and positionSizingValid and positionRiskWithinLimit and m7RiskDirectionMatches
+
+// Targets and base-approval events are reset on every bar, then captured once
+// for a new M8 setup. M8-C never moves a stored target afterward.
+bullishBaseRiskApprovedEvent := false
+bearishBaseRiskApprovedEvent := false
+bool targetApprovalResetRequired = sizingContextResetRequired or not riskContextActive
+if targetApprovalResetRequired
+    riskTP1 := na
+    riskTP2 := na
+    riskRR1 := na
+    riskRR2 := na
+    riskTargetsValid := false
+    riskApprovedStored := false
+    baseRiskApproved := false
+    riskApproved := false
+else if newRiskContext
+    riskTP1 := tp1Candidate
+    riskTP2 := tp2Candidate
+    riskRR1 := rr1Candidate
+    riskRR2 := rr2Candidate
+    riskTargetsValid := targetOrderingCandidateValid
+    riskApprovedStored := baseRiskApprovalCandidate
+    baseRiskApproved := baseRiskApprovalCandidate
+    bullishBaseRiskApprovedEvent := baseRiskApprovalCandidate and riskDirection == TradeBias.Bullish
+    bearishBaseRiskApprovedEvent := baseRiskApprovalCandidate and riskDirection == TradeBias.Bearish
+else
+    baseRiskApproved := riskApprovedStored and finalRiskApprovalEnabled and riskEngineEnabled and m7RiskDirectionMatches
+
+// Exposed M8-C outputs are frozen target context, with validity recalculated
+// only from those fixed values and current M8/M7 lifecycle validity.
+float projectedTP1 = riskContextActive ? riskTP1 : na
+float projectedTP2 = riskContextActive ? riskTP2 : na
+bool tp1Valid = riskContextActive and not na(projectedTP1) and (riskDirection == TradeBias.Bullish ? projectedTP1 > riskEntryPrice : riskDirection == TradeBias.Bearish ? projectedTP1 < riskEntryPrice : false)
+bool tp2Valid = riskContextActive and not na(projectedTP2) and (riskDirection == TradeBias.Bullish ? projectedTP2 > riskEntryPrice : riskDirection == TradeBias.Bearish ? projectedTP2 < riskEntryPrice : false)
+float projectedRR1 = tp1Valid ? riskRR1 : na
+float projectedRR2 = tp2Valid ? riskRR2 : na
+bool rr1Pass = not na(projectedRR1) and projectedRR1 >= minimumRequiredRr
+bool rr2Pass = not na(projectedRR2) and projectedRR2 >= minimumRequiredRr
+bool targetStructureValid = tp1Valid and tp2Valid and (riskDirection == TradeBias.Bullish ? projectedTP2 > projectedTP1 and projectedTP1 > riskEntryPrice and riskEntryPrice > riskStopPrice : riskDirection == TradeBias.Bearish ? projectedTP2 < projectedTP1 and projectedTP1 < riskEntryPrice and riskEntryPrice < riskStopPrice : false)
+bool requiredRrValidationPass = requireTp2RrValidation ? rr2Pass : rr1Pass
+baseRiskApproved := riskApprovedStored and finalRiskApprovalEnabled and riskEngineEnabled and riskContextActive and proposedStopValid and stopDistanceValid and riskSizingValid and positionSizingValid and positionRiskWithinLimit and targetStructureValid and requiredRrValidationPass and m7RiskDirectionMatches
+
+//==============================================================================
+// 23. M8-D DAILY AND SESSION RISK GUARDS
+//==============================================================================
+// M8 has no order execution. Allocated risk therefore represents final
+// approved setup risk, while daily P/L is only a strategy.equity diagnostic
+// until M9 produces actual executed-trade outcomes.
+bool newRiskDay = not na(time("D")[1]) and time("D") != time("D")[1]
+if na(dailyStartEquity) or newRiskDay
+    dailyStartEquity := strategy.equity
+    dailyAllocatedRisk := 0.0
+    dailyApprovedSetupCount := 0
+if na(sessionStartEquity) or (resetGuardsOnNewSession and sessionState.justStarted)
+    sessionStartEquity := strategy.equity
+    if resetGuardsOnNewSession and sessionState.justStarted
+        sessionAllocatedRisk := 0.0
+        sessionApprovedSetupCount := 0
+dailyPnL := not na(dailyStartEquity) ? strategy.equity - dailyStartEquity : na
+dailyPnLPercent := not na(dailyStartEquity) and dailyStartEquity > 0.0 ? dailyPnL * 100.0 / dailyStartEquity : na
+dailyAllocatedRiskPercent := not na(dailyStartEquity) and dailyStartEquity > 0.0 ? dailyAllocatedRisk * 100.0 / dailyStartEquity : na
+sessionAllocatedRiskPercent := not na(sessionStartEquity) and sessionStartEquity > 0.0 ? sessionAllocatedRisk * 100.0 / sessionStartEquity : na
+float pendingApprovedRisk = baseRiskApproved and newRiskContext and not na(riskCashAmount) and riskCashAmount >= 0.0 ? riskCashAmount : 0.0
+bool dailyBaselineValid = not na(dailyStartEquity) and dailyStartEquity > 0.0
+bool sessionBaselineValid = not na(sessionStartEquity) and sessionStartEquity > 0.0
+dailyRiskBudgetAvailable := not dailyRiskGuardEnabled or dailyBaselineValid and dailyAllocatedRisk + pendingApprovedRisk <= dailyStartEquity * maximumDailyRiskPercent * 0.01
+dailyLossLimitPass := not dailyRiskGuardEnabled or not na(dailyPnLPercent) and dailyPnLPercent > -maximumDailyLossPercent
+dailyTradeCountPass := not dailyRiskGuardEnabled or dailyApprovedSetupCount < maximumTradesPerDay
+// M8 intentionally leaves this at zero. Only M9 can safely incorporate
+// realized closed-trade outcomes; setup/retest failures are not losses here.
+consecutiveLossLimitPass := not dailyRiskGuardEnabled or consecutiveLossCount < maximumConsecutiveLosses
+sessionRiskBudgetAvailable := not sessionRiskGuardEnabled or sessionBaselineValid and sessionAllocatedRisk + pendingApprovedRisk <= sessionStartEquity * maximumSessionRiskPercent * 0.01
+riskGuardPass := dailyRiskBudgetAvailable and dailyLossLimitPass and dailyTradeCountPass and consecutiveLossLimitPass and sessionRiskBudgetAvailable
+blockedByDailyRisk := dailyRiskGuardEnabled and not dailyRiskBudgetAvailable
+blockedByDailyLoss := dailyRiskGuardEnabled and not dailyLossLimitPass
+blockedByTradeCount := dailyRiskGuardEnabled and not dailyTradeCountPass
+blockedByConsecutiveLosses := dailyRiskGuardEnabled and not consecutiveLossLimitPass
+blockedBySessionRisk := sessionRiskGuardEnabled and not sessionRiskBudgetAvailable
+int riskBlockCount = (blockedByDailyRisk ? 1 : 0) + (blockedByDailyLoss ? 1 : 0) + (blockedByTradeCount ? 1 : 0) + (blockedByConsecutiveLosses ? 1 : 0) + (blockedBySessionRisk ? 1 : 0)
+riskBlockReason := riskBlockCount > 1 ? RiskBlockReason.Multiple : blockedByDailyRisk ? RiskBlockReason.DailyRisk : blockedByDailyLoss ? RiskBlockReason.DailyLoss : blockedByTradeCount ? RiskBlockReason.TradeCount : blockedByConsecutiveLosses ? RiskBlockReason.ConsecutiveLosses : blockedBySessionRisk ? RiskBlockReason.SessionRisk : RiskBlockReason.None
+
+// Public approval is the final guarded result. Its events are asserted only
+// on an approved new M8 context, so guards cannot double-count persistent state.
+bullishRiskApprovedEvent := false
+bearishRiskApprovedEvent := false
+riskApproved := baseRiskApproved and riskGuardPass
+bool bullishRiskApproved = riskApproved and bullishTradeQualified and riskDirection == TradeBias.Bullish
+bool bearishRiskApproved = riskApproved and bearishTradeQualified and riskDirection == TradeBias.Bearish
+if newRiskContext and riskApproved
+    bullishRiskApprovedEvent := riskDirection == TradeBias.Bullish
+    bearishRiskApprovedEvent := riskDirection == TradeBias.Bearish
+if bullishRiskApprovedEvent or bearishRiskApprovedEvent
+    dailyAllocatedRisk += riskCashAmount
+    dailyApprovedSetupCount += 1
+    sessionAllocatedRisk += riskCashAmount
+    sessionApprovedSetupCount += 1
+    dailyAllocatedRiskPercent := dailyBaselineValid ? dailyAllocatedRisk * 100.0 / dailyStartEquity : na
+    sessionAllocatedRiskPercent := sessionBaselineValid ? sessionAllocatedRisk * 100.0 / sessionStartEquity : na
+
+// Dashboard text is formed in the main execution scope to avoid enum qualifier
+// coercion through UpdateDashboard.
+riskDirectionDashboardText := riskDirection == TradeBias.Bullish ? "Bullish" : riskDirection == TradeBias.Bearish ? "Bearish" : "None"
+riskStopSourceDashboardText := riskStopSource == StopSource.ATR ? "ATR" : riskStopSource == StopSource.Swing ? "Swing" : riskStopSource == StopSource.OpeningRange ? "Opening Range" : riskStopSource == StopSource.Retest ? "Retest" : riskStopSource == StopSource.Conservative ? "Conservative" : "None"
+riskBlockReasonDashboardText := riskBlockReason == RiskBlockReason.DailyRisk ? "Daily Risk" : riskBlockReason == RiskBlockReason.DailyLoss ? "Daily Loss" : riskBlockReason == RiskBlockReason.TradeCount ? "Trade Count" : riskBlockReason == RiskBlockReason.ConsecutiveLosses ? "Consecutive Losses" : riskBlockReason == RiskBlockReason.SessionRisk ? "Session Risk" : riskBlockReason == RiskBlockReason.Multiple ? "Multiple" : "None"
 
 // Dashboard text is formed in the main execution scope. This prevents Pine
 // from coercing series enum values to const parameters through UpdateDashboard.
