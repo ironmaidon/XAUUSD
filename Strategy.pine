@@ -1,11 +1,14 @@
 //@version=6
 // XAUUSD Institutional Framework
-// Version: 0.6.0
+// Version: 0.7.0
 //
 // Session and Opening Range engine. Every state mutation happens on confirmed
 // bars, so the engine never uses future values or repainting calculations.
 //
 // Changelog:
+// - 0.7.0: Added M7 directional component scoring, mandatory setup gates,
+//          bounded penalties and adjusted scores, final directional
+//          qualification/conflict resolution, setup lifecycle, and visuals.
 // - 0.6.0: Added M6-A completed daily/weekly context, pivot-confirmed equal
 //          high/low liquidity levels, M6-B liquidity sweep context, and M6-C
 //          bounded Fair Value Gap lifecycle/proximity context, and M6-D basic
@@ -24,7 +27,7 @@
 //============================================================================== 
 // 1. STRATEGY DECLARATION
 //============================================================================== 
-strategy("XAUUSD Institutional Framework v0.6.0", "XAUUSD v0.6.0", overlay = true,
+strategy("XAUUSD Institutional Framework v0.7.0", "XAUUSD v0.7.0", overlay = true,
      pyramiding = 0, calc_on_every_tick = false, calc_on_order_fills = false,
      process_orders_on_close = true, initial_capital = 10000, currency = currency.USD,
      default_qty_type = strategy.percent_of_equity, default_qty_value = 1)
@@ -32,7 +35,7 @@ strategy("XAUUSD Institutional Framework v0.6.0", "XAUUSD v0.6.0", overlay = tru
 //============================================================================== 
 // 2. CONSTANTS AND ENUMS
 //============================================================================== 
-string STRATEGY_VERSION = "0.6.0"
+string STRATEGY_VERSION = "0.7.0"
 string DASHBOARD_TITLE = "XAUUSD SESSION ENGINE"
 int MILLISECONDS_PER_MINUTE = 60000
 int ATR_LENGTH = 14
@@ -174,6 +177,30 @@ enum MarketStructure
     LowerLow
     Neutral
 
+// M7-owned lifecycle state for a qualified directional setup. This state is
+// diagnostic only and never places or manages a trade.
+enum TradeSetupState
+    None
+    BullishQualified
+    BearishQualified
+    Conflict
+    Disqualified
+    Expired
+
+// M7-owned final setup bias. It is deliberately separate from SmartMoneyBias.
+enum TradeBias
+    None
+    Bullish
+    Bearish
+    Neutral
+
+// M7-owned diagnostic classification of a selected setup score.
+enum TradeSetupStrength
+    Weak
+    Normal
+    Strong
+    Extreme
+
 //============================================================================== 
 // 3. INPUTS
 //============================================================================== 
@@ -195,6 +222,8 @@ string GROUP_FAIR_VALUE_GAPS = "15. Fair Value Gaps"
 string GROUP_ORDER_BLOCKS = "16. Order Blocks"
 string GROUP_PREMIUM_DISCOUNT = "17. Premium / Discount"
 string GROUP_SMART_MONEY_SCORE = "18. Smart Money Score"
+string GROUP_TRADE_SCORING = "19. Trade Scoring Engine"
+string GROUP_TRADE_SCORING_VISUALS = "20. Trade Scoring Visuals"
 
 bool enabled = input.bool(true, "Enable strategy", group = GROUP_GENERAL)
 string expectedSymbol = input.string("XAUUSD", "Expected symbol", group = GROUP_GENERAL)
@@ -329,6 +358,28 @@ bool showFvgZones = input.bool(true, "Show FVG zones", group = GROUP_SMART_MONEY
 bool showOrderBlocks = input.bool(true, "Show Order Blocks", group = GROUP_SMART_MONEY_SCORE)
 bool showPremiumDiscount = input.bool(false, "Show Premium/Discount", group = GROUP_SMART_MONEY_SCORE)
 bool showSmartMoneyScore = input.bool(true, "Show Smart Money score", group = GROUP_SMART_MONEY_SCORE)
+bool tradeScoringEnabled = input.bool(true, "Enable Trade Scoring", group = GROUP_TRADE_SCORING)
+float tradeQualificationThreshold = input.float(70.0, "Trade qualification threshold", minval = 0.0, maxval = 100.0, group = GROUP_TRADE_SCORING)
+bool requireBreakoutConfirmationForScore = input.bool(true, "Require breakout confirmation", group = GROUP_TRADE_SCORING)
+bool requireRetestConfirmationForScore = input.bool(true, "Require retest confirmation", group = GROUP_TRADE_SCORING)
+bool requireTrendAlignmentForScore = input.bool(true, "Require trend alignment", group = GROUP_TRADE_SCORING)
+float minimumTradeTrendScore = input.float(10.0, "Minimum trend component score", minval = 0.0, maxval = 20.0, group = GROUP_TRADE_SCORING)
+float minimumTradeBreakoutScore = input.float(10.0, "Minimum breakout component score", minval = 0.0, maxval = 25.0, group = GROUP_TRADE_SCORING)
+float minimumTradeRetestScore = input.float(10.0, "Minimum retest component score", minval = 0.0, maxval = 25.0, group = GROUP_TRADE_SCORING)
+float minimumTradeSmartMoneyScore = input.float(8.0, "Minimum Smart Money component score", minval = 0.0, maxval = 20.0, group = GROUP_TRADE_SCORING)
+bool enableSetupPenalties = input.bool(true, "Enable setup penalties", group = GROUP_TRADE_SCORING)
+float failedContextPenalty = input.float(20.0, "Failed context penalty", minval = 0.0, maxval = 100.0, group = GROUP_TRADE_SCORING)
+float opposingTrendPenalty = input.float(10.0, "Opposing trend penalty", minval = 0.0, maxval = 100.0, group = GROUP_TRADE_SCORING)
+float opposingSmartMoneyPenalty = input.float(10.0, "Opposing Smart Money penalty", minval = 0.0, maxval = 100.0, group = GROUP_TRADE_SCORING)
+float maximumPreferredBreakoutDistanceAtr = input.float(1.5, "Maximum preferred breakout distance ATR", minval = 0.0, group = GROUP_TRADE_SCORING)
+float excessiveBreakoutDistancePenalty = input.float(8.0, "Excessive breakout distance penalty", minval = 0.0, maxval = 100.0, group = GROUP_TRADE_SCORING)
+float lateRetestPenalty = input.float(8.0, "Late retest penalty", minval = 0.0, maxval = 100.0, group = GROUP_TRADE_SCORING)
+float minimumDirectionalScoreDifference = input.float(10.0, "Minimum directional score difference", minval = 0.0, maxval = 50.0, group = GROUP_TRADE_SCORING)
+bool rejectDirectionalConflict = input.bool(true, "Reject directional conflict", group = GROUP_TRADE_SCORING)
+bool showQualifiedSetupMarkers = input.bool(true, "Show qualified setup markers", group = GROUP_TRADE_SCORING_VISUALS)
+bool showSetupScore = input.bool(true, "Show setup score", group = GROUP_TRADE_SCORING_VISUALS)
+bool showTradeBiasBackground = input.bool(false, "Show trade bias background", group = GROUP_TRADE_SCORING_VISUALS)
+bool showRawVsAdjustedScore = input.bool(true, "Show raw vs adjusted score", group = GROUP_TRADE_SCORING_VISUALS)
 
 //============================================================================== 
 // 4. STATE MODELS
@@ -541,6 +592,32 @@ var float bullishSmartMoneyScore = 0.0
 var float bearishSmartMoneyScore = 0.0
 var SmartMoneyBias smartMoneyBias = SmartMoneyBias.Neutral
 var SmartMoneyStrength smartMoneyStrength = SmartMoneyStrength.Weak
+var string smartMoneyBiasDashboardText = "Neutral"
+var string smartMoneyStrengthDashboardText = "Weak"
+var float bullishTradeScore = 0.0
+var float bearishTradeScore = 0.0
+var float bullishTradeScoreRawDisplay = na
+var float bearishTradeScoreRawDisplay = na
+var float bullishTradePenaltyDisplay = na
+var float bearishTradePenaltyDisplay = na
+var bool bullishMandatoryGateDisplay = false
+var bool bearishMandatoryGateDisplay = false
+var bool bullishTradeCandidateDisplay = false
+var bool bearishTradeCandidateDisplay = false
+var float tradeScoreDifferenceDisplay = na
+var TradeSetupState tradeSetupState = TradeSetupState.None
+var TradeBias tradeBias = TradeBias.None
+var TradeSetupStrength tradeSetupStrength = TradeSetupStrength.Weak
+var string tradeSetupStateDashboardText = "None"
+var string tradeBiasDashboardText = "None"
+var string tradeSetupStrengthDashboardText = "Weak"
+var bool bullishTradeQualified = false
+var bool bearishTradeQualified = false
+var bool bullishTradeQualifiedEvent = false
+var bool bearishTradeQualifiedEvent = false
+var int tradeSetupBarIndex = na
+var float tradeSetupScore = na
+var TradeBias tradeSetupDirection = TradeBias.None
 var bool priceAbovePDH = false
 var bool priceBelowPDL = false
 var bool priceAbovePWH = false
@@ -608,6 +685,18 @@ SmartMoneyBiasText(series SmartMoneyBias bias) =>
 
 SmartMoneyStrengthText(series SmartMoneyStrength strength) =>
     strength == SmartMoneyStrength.Extreme ? "Extreme" : strength == SmartMoneyStrength.Strong ? "Strong" : strength == SmartMoneyStrength.Normal ? "Normal" : "Weak"
+
+// Returns a readable label for every M7 setup-lifecycle state.
+TradeSetupStateText(series TradeSetupState state) =>
+    state == TradeSetupState.BullishQualified ? "Bullish Qualified" : state == TradeSetupState.BearishQualified ? "Bearish Qualified" : state == TradeSetupState.Conflict ? "Conflict" : state == TradeSetupState.Disqualified ? "Disqualified" : state == TradeSetupState.Expired ? "Expired" : "None"
+
+// Returns a readable label for the M7-owned final trade bias.
+TradeBiasText(series TradeBias bias) =>
+    bias == TradeBias.Bullish ? "Bullish" : bias == TradeBias.Bearish ? "Bearish" : bias == TradeBias.Neutral ? "Neutral" : "None"
+
+// Returns a readable label for every M7 setup-strength classification.
+TradeSetupStrengthText(series TradeSetupStrength strength) =>
+    strength == TradeSetupStrength.Extreme ? "Extreme" : strength == TradeSetupStrength.Strong ? "Strong" : strength == TradeSetupStrength.Normal ? "Normal" : "Weak"
 
 // Formats a nullable decimal value for the dashboard without displaying na.
 FormatValueOrDash(float value) =>
@@ -993,7 +1082,7 @@ CalculateTrendLabel(label previousLabel) =>
 //============================================================================== 
 // 11. DASHBOARD AND DEBUG
 //============================================================================== 
-var table dashboard = table.new(position.top_right, 2, 50, border_width = 1)
+var table dashboard = table.new(position.top_right, 2, 67, border_width = 1)
 var table debugTable = table.new(position.bottom_right, 2, 6, border_width = 1)
 
 // Writes one consistently styled dashboard row.
@@ -1039,8 +1128,8 @@ UpdateDashboard() =>
             SetDashboardRow(dashboard, 31, "Retest penetration ATR", FormatValueOrDash(retestPenetrationATR))
             SetDashboardRow(dashboard, 32, "Retest confirmed", retestConfirmed ? "Yes" : "No")
             SetDashboardRow(dashboard, 33, "Retest failed", retestFailed ? "Yes" : "No")
-            SetDashboardRow(dashboard, 34, "Smart Money bias", SmartMoneyBiasText(smartMoneyBias))
-            SetDashboardRow(dashboard, 35, "SMC strength", SmartMoneyStrengthText(smartMoneyStrength))
+            SetDashboardRow(dashboard, 34, "Smart Money bias", smartMoneyBiasDashboardText)
+            SetDashboardRow(dashboard, 35, "SMC strength", smartMoneyStrengthDashboardText)
             SetDashboardRow(dashboard, 36, "Bullish SMC score", showSmartMoneyScore ? FormatValueOrDash(bullishSmartMoneyScore) : "-")
             SetDashboardRow(dashboard, 37, "Bearish SMC score", showSmartMoneyScore ? FormatValueOrDash(bearishSmartMoneyScore) : "-")
             SetDashboardRow(dashboard, 38, "Liquidity sweep", bullishLiquiditySweep ? "Bullish" : bearishLiquiditySweep ? "Bearish" : "-")
@@ -1055,8 +1144,25 @@ UpdateDashboard() =>
             SetDashboardRow(dashboard, 47, "Equal low", equalLowActive ? "Active" : "-")
             SetDashboardRow(dashboard, 48, "PDH / PDL", priceAbovePDH ? "Above PDH" : priceBelowPDL ? "Below PDL" : "Between")
             SetDashboardRow(dashboard, 49, "PWH / PWL", priceAbovePWH ? "Above PWH" : priceBelowPWL ? "Below PWL" : "Between")
+            SetDashboardRow(dashboard, 50, "Trade setup state", tradeSetupStateDashboardText)
+            SetDashboardRow(dashboard, 51, "Trade bias", tradeBiasDashboardText)
+            SetDashboardRow(dashboard, 52, "Setup strength", tradeSetupStrengthDashboardText)
+            SetDashboardRow(dashboard, 53, "Setup score", FormatValueOrDash(tradeSetupScore))
+            SetDashboardRow(dashboard, 54, "Bullish raw score", showRawVsAdjustedScore ? FormatValueOrDash(bullishTradeScoreRawDisplay) : "-")
+            SetDashboardRow(dashboard, 55, "Bearish raw score", showRawVsAdjustedScore ? FormatValueOrDash(bearishTradeScoreRawDisplay) : "-")
+            SetDashboardRow(dashboard, 56, "Bullish adjusted score", showRawVsAdjustedScore ? FormatValueOrDash(bullishTradeScore) : "-")
+            SetDashboardRow(dashboard, 57, "Bearish adjusted score", showRawVsAdjustedScore ? FormatValueOrDash(bearishTradeScore) : "-")
+            SetDashboardRow(dashboard, 58, "Bullish penalty", showRawVsAdjustedScore ? FormatValueOrDash(bullishTradePenaltyDisplay) : "-")
+            SetDashboardRow(dashboard, 59, "Bearish penalty", showRawVsAdjustedScore ? FormatValueOrDash(bearishTradePenaltyDisplay) : "-")
+            SetDashboardRow(dashboard, 60, "Bullish mandatory gates", bullishMandatoryGateDisplay ? "Pass" : "Fail")
+            SetDashboardRow(dashboard, 61, "Bearish mandatory gates", bearishMandatoryGateDisplay ? "Pass" : "Fail")
+            SetDashboardRow(dashboard, 62, "Bullish candidate", bullishTradeCandidateDisplay ? "Yes" : "No")
+            SetDashboardRow(dashboard, 63, "Bearish candidate", bearishTradeCandidateDisplay ? "Yes" : "No")
+            SetDashboardRow(dashboard, 64, "Bullish qualified", bullishTradeQualified ? "Yes" : "No")
+            SetDashboardRow(dashboard, 65, "Bearish qualified", bearishTradeQualified ? "Yes" : "No")
+            SetDashboardRow(dashboard, 66, "Directional score difference", FormatValueOrDash(tradeScoreDifferenceDisplay))
         else
-            table.clear(dashboard, 0, 0, 1, 49)
+            table.clear(dashboard, 0, 0, 1, 66)
 
 // Updates the diagnostic panel only on the last chart bar when debugging is enabled.
 UpdateDebugPanel() =>
@@ -1793,6 +1899,190 @@ bearishSmartMoneyScore := math.min(100.0, bearishSweepContextScore + bearishFvgC
 smartMoneyBias := bullishSmartMoneyScore - bearishSmartMoneyScore >= smartMoneyBiasMinimumDifference ? SmartMoneyBias.Bullish : bearishSmartMoneyScore - bullishSmartMoneyScore >= smartMoneyBiasMinimumDifference ? SmartMoneyBias.Bearish : SmartMoneyBias.Neutral
 float dominantSmartMoneyScore = math.max(bullishSmartMoneyScore, bearishSmartMoneyScore)
 smartMoneyStrength := dominantSmartMoneyScore >= 85.0 ? SmartMoneyStrength.Extreme : dominantSmartMoneyScore >= 65.0 ? SmartMoneyStrength.Strong : dominantSmartMoneyScore >= 40.0 ? SmartMoneyStrength.Normal : SmartMoneyStrength.Weak
+float bullishSessionScore = math.min(10.0, (sessionState.isActive ? 2.0 : 0.0) + (rangeState.isComplete ? 2.0 : 0.0) + (rangeState.qualityAccepted ? 3.0 : 0.0) + (breakoutRangeQualityValid ? 3.0 : 0.0))
+float bearishSessionScore = bullishSessionScore
+float bullishTrendScore = math.min(20.0, (trendState.direction == TrendDirection.Bullish ? 5.0 : 0.0) + (trendState.htfFastEma > trendState.htfSlowEma ? 5.0 : 0.0) + (close > trendState.vwapValue ? 3.0 : 0.0) + (trendState.isTrending and trendState.plusDi > trendState.minusDi ? 3.0 : 0.0) + ((trendState.structure == MarketStructure.HigherHigh or trendState.structure == MarketStructure.HigherLow) ? 4.0 : 0.0))
+float bearishTrendScore = math.min(20.0, (trendState.direction == TrendDirection.Bearish ? 5.0 : 0.0) + (trendState.htfFastEma < trendState.htfSlowEma ? 5.0 : 0.0) + (close < trendState.vwapValue ? 3.0 : 0.0) + (trendState.isTrending and trendState.minusDi > trendState.plusDi ? 3.0 : 0.0) + ((trendState.structure == MarketStructure.LowerHigh or trendState.structure == MarketStructure.LowerLow) ? 4.0 : 0.0))
+bool bullishBreakoutContext = breakoutState == BreakoutState.BullishConfirmed and breakoutTradeDirection == TradeDirection.Long and not breakoutFailed
+bool bearishBreakoutContext = breakoutState == BreakoutState.BearishConfirmed and breakoutTradeDirection == TradeDirection.Short and not breakoutFailed
+float bullishTradeBreakoutScore = bullishBreakoutContext ? math.min(25.0, math.max(0.0, bullishBreakoutScore * 0.25)) : 0.0
+float bearishTradeBreakoutScore = bearishBreakoutContext ? math.min(25.0, math.max(0.0, bearishBreakoutScore * 0.25)) : 0.0
+bool bullishTradeRetestContext = retestTradeDirection == TradeDirection.Long and (retestState == RetestState.RetestDetected or retestState == RetestState.RetestConfirmed) and not retestFailed
+bool bearishTradeRetestContext = retestTradeDirection == TradeDirection.Short and (retestState == RetestState.RetestDetected or retestState == RetestState.RetestConfirmed) and not retestFailed
+float bullishRetestSourceScore = retestState == RetestState.RetestConfirmed ? retestScore : bullishRetestScore
+float bearishRetestSourceScore = retestState == RetestState.RetestConfirmed ? retestScore : bearishRetestScore
+float bullishTradeRetestScore = bullishTradeRetestContext and not na(bullishRetestSourceScore) ? math.min(25.0, math.max(0.0, bullishRetestSourceScore * 0.25)) : 0.0
+float bearishTradeRetestScore = bearishTradeRetestContext and not na(bearishRetestSourceScore) ? math.min(25.0, math.max(0.0, bearishRetestSourceScore * 0.25)) : 0.0
+float bullishTradeSmartMoneyScore = math.min(20.0, math.max(0.0, bullishSmartMoneyScore * 0.20))
+float bearishTradeSmartMoneyScore = math.min(20.0, math.max(0.0, bearishSmartMoneyScore * 0.20))
+float bullishTradeScoreRaw = math.min(100.0, math.max(0.0, bullishSessionScore + bullishTrendScore + bullishTradeBreakoutScore + bullishTradeRetestScore + bullishTradeSmartMoneyScore))
+float bearishTradeScoreRaw = math.min(100.0, math.max(0.0, bearishSessionScore + bearishTrendScore + bearishTradeBreakoutScore + bearishTradeRetestScore + bearishTradeSmartMoneyScore))
+bool bullishSessionGate = sessionState.isActive and rangeState.isComplete and rangeState.qualityAccepted and breakoutRangeQualityValid
+bool bearishSessionGate = bullishSessionGate
+bool bullishBreakoutGate = not requireBreakoutConfirmationForScore or bullishBreakoutContext
+bool bearishBreakoutGate = not requireBreakoutConfirmationForScore or bearishBreakoutContext
+bool bullishRetestGate = not requireRetestConfirmationForScore or (retestState == RetestState.RetestConfirmed and retestTradeDirection == TradeDirection.Long and not retestFailed)
+bool bearishRetestGate = not requireRetestConfirmationForScore or (retestState == RetestState.RetestConfirmed and retestTradeDirection == TradeDirection.Short and not retestFailed)
+bool bullishTrendGate = (not requireTrendAlignmentForScore or trendState.direction == TrendDirection.Bullish) and bullishTrendScore >= minimumTradeTrendScore
+bool bearishTrendGate = (not requireTrendAlignmentForScore or trendState.direction == TrendDirection.Bearish) and bearishTrendScore >= minimumTradeTrendScore
+bool bullishSmartMoneyGate = bullishTradeSmartMoneyScore >= minimumTradeSmartMoneyScore
+bool bearishSmartMoneyGate = bearishTradeSmartMoneyScore >= minimumTradeSmartMoneyScore
+bool bullishComponentMinimumsPass = bullishTradeBreakoutScore >= minimumTradeBreakoutScore and bullishTradeRetestScore >= minimumTradeRetestScore
+bool bearishComponentMinimumsPass = bearishTradeBreakoutScore >= minimumTradeBreakoutScore and bearishTradeRetestScore >= minimumTradeRetestScore
+bool bullishMandatoryGatePass = bullishSessionGate and bullishBreakoutGate and bullishRetestGate and bullishTrendGate and bullishSmartMoneyGate and bullishComponentMinimumsPass
+bool bearishMandatoryGatePass = bearishSessionGate and bearishBreakoutGate and bearishRetestGate and bearishTrendGate and bearishSmartMoneyGate and bearishComponentMinimumsPass
+bool bullishHardDisqualified = not bullishSessionGate or (requireBreakoutConfirmationForScore and (breakoutState == BreakoutState.BullishFailed or breakoutState == BreakoutState.Invalidated)) or (requireRetestConfirmationForScore and retestTradeDirection == TradeDirection.Long and (retestState == RetestState.RetestFailed or retestState == RetestState.Expired))
+bool bearishHardDisqualified = not bearishSessionGate or (requireBreakoutConfirmationForScore and (breakoutState == BreakoutState.BearishFailed or breakoutState == BreakoutState.Invalidated)) or (requireRetestConfirmationForScore and retestTradeDirection == TradeDirection.Short and (retestState == RetestState.RetestFailed or retestState == RetestState.Expired))
+bool bullishLateRetest = retestTradeDirection == TradeDirection.Long and not na(retestBarsSinceBreakout) and (retestWindowMode == RetestWindowMode.Bars ? retestBarsSinceBreakout > retestWindowValue * 0.75 : not na(retestStartTime) and time - retestStartTime > retestWindowValue * MILLISECONDS_PER_MINUTE * 0.75)
+bool bearishLateRetest = retestTradeDirection == TradeDirection.Short and not na(retestBarsSinceBreakout) and (retestWindowMode == RetestWindowMode.Bars ? retestBarsSinceBreakout > retestWindowValue * 0.75 : not na(retestStartTime) and time - retestStartTime > retestWindowValue * MILLISECONDS_PER_MINUTE * 0.75)
+float bullishTradePenalty = enableSetupPenalties ? math.min(100.0, ((breakoutState == BreakoutState.BullishFailed or (retestTradeDirection == TradeDirection.Long and retestFailed)) ? failedContextPenalty : 0.0) + (trendState.direction == TrendDirection.Bearish ? opposingTrendPenalty : 0.0) + (smartMoneyBias == SmartMoneyBias.Bearish ? opposingSmartMoneyPenalty : 0.0) + (bullishBreakoutContext and not na(breakoutDistanceATR) and breakoutDistanceATR > maximumPreferredBreakoutDistanceAtr ? excessiveBreakoutDistancePenalty : 0.0) + (bullishLateRetest ? lateRetestPenalty : 0.0)) : 0.0
+float bearishTradePenalty = enableSetupPenalties ? math.min(100.0, ((breakoutState == BreakoutState.BearishFailed or (retestTradeDirection == TradeDirection.Short and retestFailed)) ? failedContextPenalty : 0.0) + (trendState.direction == TrendDirection.Bullish ? opposingTrendPenalty : 0.0) + (smartMoneyBias == SmartMoneyBias.Bullish ? opposingSmartMoneyPenalty : 0.0) + (bearishBreakoutContext and not na(breakoutDistanceATR) and breakoutDistanceATR > maximumPreferredBreakoutDistanceAtr ? excessiveBreakoutDistancePenalty : 0.0) + (bearishLateRetest ? lateRetestPenalty : 0.0)) : 0.0
+float bullishTradeScoreAdjusted = math.min(100.0, math.max(0.0, bullishTradeScoreRaw - bullishTradePenalty))
+float bearishTradeScoreAdjusted = math.min(100.0, math.max(0.0, bearishTradeScoreRaw - bearishTradePenalty))
+bullishTradeScore := tradeScoringEnabled ? bullishTradeScoreAdjusted : 0.0
+bearishTradeScore := tradeScoringEnabled ? bearishTradeScoreAdjusted : 0.0
+
+//==============================================================================
+// 19. M7-C SETUP QUALIFICATION AND LIFECYCLE
+//==============================================================================
+// The threshold applies only when a setup is created. Once qualified, its
+// lifecycle is controlled by the mandatory contextual gates and M2/M4/M5 state,
+// rather than transient score fluctuations caused by bounded penalties.
+bool bullishScoreThresholdPass = not na(bullishTradeScore) and bullishTradeScore >= tradeQualificationThreshold
+bool bearishScoreThresholdPass = not na(bearishTradeScore) and bearishTradeScore >= tradeQualificationThreshold
+bool bullishCurrentLifecycleValid = bullishBreakoutContext and bullishTradeRetestContext
+bool bearishCurrentLifecycleValid = bearishBreakoutContext and bearishTradeRetestContext
+bool bullishTradeQualificationCandidate = tradeScoringEnabled and barstate.isconfirmed and bullishMandatoryGatePass and not bullishHardDisqualified and bullishScoreThresholdPass and bullishCurrentLifecycleValid
+bool bearishTradeQualificationCandidate = tradeScoringEnabled and barstate.isconfirmed and bearishMandatoryGatePass and not bearishHardDisqualified and bearishScoreThresholdPass and bearishCurrentLifecycleValid
+float tradeScoreDifference = not na(bullishTradeScore) and not na(bearishTradeScore) ? math.abs(bullishTradeScore - bearishTradeScore) : na
+float bullishScoreLead = not na(bullishTradeScore) and not na(bearishTradeScore) ? bullishTradeScore - bearishTradeScore : na
+float bearishScoreLead = not na(bullishTradeScore) and not na(bearishTradeScore) ? bearishTradeScore - bullishTradeScore : na
+bool dualQualification = bullishTradeQualificationCandidate and bearishTradeQualificationCandidate
+bool bullishDualLead = dualQualification and not na(bullishScoreLead) and bullishScoreLead > 0.0
+bool bearishDualLead = dualQualification and not na(bearishScoreLead) and bearishScoreLead > 0.0
+bool directionalDifferenceMeetsMinimum = not na(tradeScoreDifference) and tradeScoreDifference > 0.0 and tradeScoreDifference >= minimumDirectionalScoreDifference
+bool dualQualificationConflict = dualQualification and not directionalDifferenceMeetsMinimum
+bool bullishDirectionSelected = (bullishTradeQualificationCandidate and not bearishTradeQualificationCandidate) or (bullishDualLead and (directionalDifferenceMeetsMinimum or not rejectDirectionalConflict))
+bool bearishDirectionSelected = (bearishTradeQualificationCandidate and not bullishTradeQualificationCandidate) or (bearishDualLead and (directionalDifferenceMeetsMinimum or not rejectDirectionalConflict))
+bool unresolvedDirectionalConflict = dualQualificationConflict and (rejectDirectionalConflict or (not bullishDualLead and not bearishDualLead))
+
+// Qualification events are explicitly reset on every bar and are asserted only
+// on entry to a new final directional setup.
+bullishTradeQualifiedEvent := false
+bearishTradeQualifiedEvent := false
+
+bool bullishActiveSetup = tradeSetupState == TradeSetupState.BullishQualified
+bool bearishActiveSetup = tradeSetupState == TradeSetupState.BearishQualified
+bool bullishLifecycleExpired = sessionState.justEnded or not sessionState.isActive or (retestTradeDirection == TradeDirection.Long and retestState == RetestState.Expired)
+bool bearishLifecycleExpired = sessionState.justEnded or not sessionState.isActive or (retestTradeDirection == TradeDirection.Short and retestState == RetestState.Expired)
+bool bullishLifecycleFailed = bullishHardDisqualified or breakoutState == BreakoutState.BullishFailed or breakoutState == BreakoutState.Invalidated or (retestTradeDirection == TradeDirection.Long and retestState == RetestState.RetestFailed)
+bool bearishLifecycleFailed = bearishHardDisqualified or breakoutState == BreakoutState.BearishFailed or breakoutState == BreakoutState.Invalidated or (retestTradeDirection == TradeDirection.Short and retestState == RetestState.RetestFailed)
+bool bullishLifecycleStale = not bullishCurrentLifecycleValid and not bullishLifecycleFailed and not bearishCurrentLifecycleValid
+bool bearishLifecycleStale = not bearishCurrentLifecycleValid and not bearishLifecycleFailed and not bullishCurrentLifecycleValid
+bool bullishContextInvalid = not bullishMandatoryGatePass or bearishCurrentLifecycleValid
+bool bearishContextInvalid = not bearishMandatoryGatePass or bullishCurrentLifecycleValid
+
+// A fresh M2 session clears M7-only setup data. M2 through M6 state remains
+// exclusively owned by its existing engines.
+if sessionState.justStarted
+    tradeSetupState := TradeSetupState.None
+    tradeBias := TradeBias.None
+    tradeSetupBarIndex := na
+    tradeSetupScore := na
+    tradeSetupDirection := TradeBias.None
+else if bullishActiveSetup
+    if bullishLifecycleExpired or bullishLifecycleStale
+        tradeSetupState := TradeSetupState.Expired
+        tradeBias := TradeBias.None
+        tradeSetupBarIndex := na
+        tradeSetupScore := na
+        tradeSetupDirection := TradeBias.None
+    else if bullishLifecycleFailed or bullishContextInvalid
+        tradeSetupState := TradeSetupState.Disqualified
+        tradeBias := TradeBias.None
+        tradeSetupBarIndex := na
+        tradeSetupScore := na
+        tradeSetupDirection := TradeBias.None
+    else if unresolvedDirectionalConflict
+        tradeSetupState := TradeSetupState.Conflict
+        tradeBias := TradeBias.Neutral
+        tradeSetupBarIndex := na
+        tradeSetupScore := na
+        tradeSetupDirection := TradeBias.None
+else if bearishActiveSetup
+    if bearishLifecycleExpired or bearishLifecycleStale
+        tradeSetupState := TradeSetupState.Expired
+        tradeBias := TradeBias.None
+        tradeSetupBarIndex := na
+        tradeSetupScore := na
+        tradeSetupDirection := TradeBias.None
+    else if bearishLifecycleFailed or bearishContextInvalid
+        tradeSetupState := TradeSetupState.Disqualified
+        tradeBias := TradeBias.None
+        tradeSetupBarIndex := na
+        tradeSetupScore := na
+        tradeSetupDirection := TradeBias.None
+    else if unresolvedDirectionalConflict
+        tradeSetupState := TradeSetupState.Conflict
+        tradeBias := TradeBias.Neutral
+        tradeSetupBarIndex := na
+        tradeSetupScore := na
+        tradeSetupDirection := TradeBias.None
+else
+    if unresolvedDirectionalConflict
+        tradeSetupState := TradeSetupState.Conflict
+        tradeBias := TradeBias.Neutral
+        tradeSetupBarIndex := na
+        tradeSetupScore := na
+        tradeSetupDirection := TradeBias.None
+    else if bullishDirectionSelected
+        tradeSetupState := TradeSetupState.BullishQualified
+        tradeBias := TradeBias.Bullish
+        tradeSetupBarIndex := bar_index
+        tradeSetupScore := bullishTradeScore
+        tradeSetupDirection := TradeBias.Bullish
+        bullishTradeQualifiedEvent := true
+    else if bearishDirectionSelected
+        tradeSetupState := TradeSetupState.BearishQualified
+        tradeBias := TradeBias.Bearish
+        tradeSetupBarIndex := bar_index
+        tradeSetupScore := bearishTradeScore
+        tradeSetupDirection := TradeBias.Bearish
+        bearishTradeQualifiedEvent := true
+    else if tradeSetupState == TradeSetupState.Conflict
+        tradeSetupState := TradeSetupState.None
+        tradeBias := TradeBias.None
+        tradeSetupBarIndex := na
+        tradeSetupScore := na
+        tradeSetupDirection := TradeBias.None
+
+// Current-state outputs are derived from the owned enum, so both directions
+// cannot qualify simultaneously. Setup strength is diagnostic and only applies
+// to an active qualified setup with a valid stored origin score.
+bullishTradeQualified := tradeSetupState == TradeSetupState.BullishQualified
+bearishTradeQualified := tradeSetupState == TradeSetupState.BearishQualified
+tradeSetupStrength := (bullishTradeQualified or bearishTradeQualified) and not na(tradeSetupScore) ? tradeSetupScore >= 90.0 ? TradeSetupStrength.Extreme : tradeSetupScore >= 75.0 ? TradeSetupStrength.Strong : tradeSetupScore >= 60.0 ? TradeSetupStrength.Normal : TradeSetupStrength.Weak : TradeSetupStrength.Weak
+
+// Dashboard text is formed in the main execution scope. This prevents Pine
+// from coercing series enum values to const parameters through UpdateDashboard.
+smartMoneyBiasDashboardText := smartMoneyBias == SmartMoneyBias.Bullish ? "Bullish" : smartMoneyBias == SmartMoneyBias.Bearish ? "Bearish" : "Neutral"
+smartMoneyStrengthDashboardText := smartMoneyStrength == SmartMoneyStrength.Extreme ? "Extreme" : smartMoneyStrength == SmartMoneyStrength.Strong ? "Strong" : smartMoneyStrength == SmartMoneyStrength.Normal ? "Normal" : "Weak"
+tradeSetupStateDashboardText := tradeSetupState == TradeSetupState.BullishQualified ? "Bullish Qualified" : tradeSetupState == TradeSetupState.BearishQualified ? "Bearish Qualified" : tradeSetupState == TradeSetupState.Conflict ? "Conflict" : tradeSetupState == TradeSetupState.Disqualified ? "Disqualified" : tradeSetupState == TradeSetupState.Expired ? "Expired" : "None"
+tradeBiasDashboardText := tradeBias == TradeBias.Bullish ? "Bullish" : tradeBias == TradeBias.Bearish ? "Bearish" : tradeBias == TradeBias.Neutral ? "Neutral" : "None"
+tradeSetupStrengthDashboardText := tradeSetupStrength == TradeSetupStrength.Extreme ? "Extreme" : tradeSetupStrength == TradeSetupStrength.Strong ? "Strong" : tradeSetupStrength == TradeSetupStrength.Normal ? "Normal" : "Weak"
+
+// M7 dashboard mirrors are assigned after the directional series are complete.
+// They keep the single dashboard independent of forward references and enum
+// qualifier coercion inside the dashboard function.
+bullishTradeScoreRawDisplay := bullishTradeScoreRaw
+bearishTradeScoreRawDisplay := bearishTradeScoreRaw
+bullishTradePenaltyDisplay := bullishTradePenalty
+bearishTradePenaltyDisplay := bearishTradePenalty
+bullishMandatoryGateDisplay := bullishMandatoryGatePass
+bearishMandatoryGateDisplay := bearishMandatoryGatePass
+bullishTradeCandidateDisplay := bullishTradeQualificationCandidate
+bearishTradeCandidateDisplay := bearishTradeQualificationCandidate
+tradeScoreDifferenceDisplay := tradeScoreDifference
 
 if na(rangeBox)
     [nextRangeBox, nextRangeHighLine, nextRangeLowLine, nextRangeMidLine, nextRangeHighLabel, nextRangeLowLabel, nextRangeWidthLabel] = CreateRangeDrawings()
@@ -1812,6 +2102,8 @@ plot(showEmaPlots ? fastEmaValue : na, "Fast EMA", color = color.teal, linewidth
 plot(showEmaPlots ? slowEmaValue : na, "Slow EMA", color = color.orange, linewidth = 2)
 color trendBackground = IsBullTrend() ? color.new(color.lime, 90) : IsBearTrend() ? color.new(color.red, 90) : color.new(color.gray, 95)
 bgcolor(showTrendBackground ? trendBackground : na, title = "Trend Background")
+color tradeBiasBackground = tradeSetupState == TradeSetupState.BullishQualified ? color.new(color.lime, 93) : tradeSetupState == TradeSetupState.BearishQualified ? color.new(color.red, 93) : tradeSetupState == TradeSetupState.Conflict ? color.new(color.orange, 94) : na
+bgcolor(showTradeBiasBackground ? tradeBiasBackground : na, title = "Trade Bias Background")
 plot(showBreakoutLevels and (breakoutConfirmed or breakoutFailed) ? breakoutPrice : na, "Breakout Level", color = breakoutTradeDirection == TradeDirection.Long ? color.lime : breakoutTradeDirection == TradeDirection.Short ? color.red : color.gray, linewidth = 2, style = plot.style_linebr)
 plotshape(showBreakoutMarkers and bullishBreakoutSignal, "Bullish Breakout", shape.triangleup, location.belowbar, color.lime, size = size.small)
 plotshape(showBreakoutMarkers and bearishBreakoutSignal, "Bearish Breakout", shape.triangledown, location.abovebar, color.red, size = size.small)
@@ -1827,6 +2119,12 @@ plotshape(showRetestMarkers and bearishRetestConfirmed, "Bearish Retest Confirme
 plotshape(showRetestMarkers and bullishRetestFailure, "Bullish Retest Failure", shape.xcross, location.abovebar, color.orange, size = size.small)
 plotshape(showRetestMarkers and bearishRetestFailure, "Bearish Retest Failure", shape.xcross, location.belowbar, color.orange, size = size.small)
 plotchar(showRetestScore and (bullishRetestConfirmed or bearishRetestConfirmed) ? retestScore : na, "Retest Score", "R", location.bottom, color = color.white)
+plotshape(showQualifiedSetupMarkers and bullishTradeQualifiedEvent, "Bullish Qualified Setup", shape.labelup, location.belowbar, color.lime, text = "LONG", textcolor = color.white, size = size.small)
+plotshape(showQualifiedSetupMarkers and bearishTradeQualifiedEvent, "Bearish Qualified Setup", shape.labeldown, location.abovebar, color.red, text = "SHORT", textcolor = color.white, size = size.small)
+if showSetupScore and bullishTradeQualifiedEvent
+    label.new(bar_index, low, "LONG " + FormatValueOrDash(tradeSetupScore), style = label.style_label_up, color = color.lime, textcolor = color.white, size = size.tiny)
+if showSetupScore and bearishTradeQualifiedEvent
+    label.new(bar_index, high, "SHORT " + FormatValueOrDash(tradeSetupScore), style = label.style_label_down, color = color.red, textcolor = color.white, size = size.tiny)
 plot(showPreviousDayLevels ? previousDayHigh : na, "Previous Day High", color = color.new(color.blue, 20), linewidth = 1, style = plot.style_linebr)
 plot(showPreviousDayLevels ? previousDayLow : na, "Previous Day Low", color = color.new(color.blue, 20), linewidth = 1, style = plot.style_linebr)
 plot(showPreviousDayLevels ? previousDayClose : na, "Previous Day Close", color = color.new(color.blue, 55), linewidth = 1, style = plot.style_linebr)
