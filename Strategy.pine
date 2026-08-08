@@ -1,11 +1,17 @@
 //@version=6
 // XAUUSD Institutional Framework
-// Version: 0.8.0
+// Version: 0.9.0
 //
 // Session and Opening Range engine. Every state mutation happens on confirmed
 // bars, so the engine never uses future values or repainting calculations.
 //
 // Changelog:
+// - 0.9.0: Added M9-A event-driven entry execution with fixed initial stop and
+//          target orders, M9-B partial-target lifecycle and residual-stop
+//          protection tracking, M9-C breakeven management after TP1, and M9-D
+//          selectable ATR, Chandelier, SuperTrend, and Swing trailing stops.
+//          M9-E adds closed-trade aggregation, realized outcomes, and guard
+//          reconciliation from actual execution.
 // - 0.8.0: Added M8-A initial stop-selection architecture and fixed initial
 //          risk-distance context, fixed position sizing, fixed-R targets/RR
 //          validation, and guarded final risk approval with dashboard support.
@@ -30,7 +36,7 @@
 //============================================================================== 
 // 1. STRATEGY DECLARATION
 //============================================================================== 
-strategy("XAUUSD Institutional Framework v0.8.0", "XAUUSD v0.8.0", overlay = true,
+strategy("XAUUSD Institutional Framework v0.9.0", "XAUUSD v0.9.0", overlay = true,
      pyramiding = 0, calc_on_every_tick = false, calc_on_order_fills = false,
      process_orders_on_close = true, initial_capital = 10000, currency = currency.USD,
      default_qty_type = strategy.percent_of_equity, default_qty_value = 1)
@@ -38,10 +44,11 @@ strategy("XAUUSD Institutional Framework v0.8.0", "XAUUSD v0.8.0", overlay = tru
 //============================================================================== 
 // 2. CONSTANTS AND ENUMS
 //============================================================================== 
-string STRATEGY_VERSION = "0.8.0"
+string STRATEGY_VERSION = "0.9.0"
 string DASHBOARD_TITLE = "XAUUSD SESSION ENGINE"
 int MILLISECONDS_PER_MINUTE = 60000
 int ATR_LENGTH = 14
+float TRADE_PROFIT_TOLERANCE = 0.01
 
 enum SessionName
     None
@@ -242,6 +249,69 @@ enum RiskBlockReason
     SessionRisk
     Multiple
 
+// M9-A entry submission policy. With process_orders_on_close enabled, both
+// supported modes deterministically submit at the approval bar's close.
+enum EntryMode
+    MarketOnApproval
+    ApprovalClose
+
+// M9-C breakeven activation source. RMultiple uses a completed-bar move from
+// the actual (or planned fallback) entry and preserves TP1-only behavior.
+enum BreakevenTriggerMode
+    TP1Hit
+    RMultiple
+
+// M9-C breakeven offset calculation. Positive offsets always improve the stop
+// in the direction of an open position.
+enum BreakevenOffsetMode
+    ExactEntry
+    Ticks
+    ATR
+
+// M9-D trailing candidate source. Exactly one selected mode can improve the
+// shared effective protective stop for an open trade.
+enum TrailingStopMode
+    None
+    ATR
+    Chandelier
+    SuperTrend
+    Swing
+
+// M9-D trailing activation policy. AfterTP1 consumes M9-B's verified fill
+// state, while RMultiple uses a completed-bar favorable move.
+enum TrailingActivationMode
+    Immediate
+    AfterTP1
+    RMultiple
+
+// The source that last improved the shared protective stop. It is diagnostic
+// state only and does not alter order or outcome behavior.
+enum ActiveStopMode
+    Initial
+    Breakeven
+    ATRTrail
+    Chandelier
+    SuperTrend
+    Swing
+
+// M9-E final lifecycle classification from realized closed-trade profit.
+enum TradeOutcome
+    None
+    Win
+    Loss
+    Breakeven
+
+// M9-E exit context. Actual closed-trade details are retained diagnostically;
+// exact target/stop prices provide conservative final-reason classification.
+enum TradeExitReason
+    None
+    TP1
+    TP2
+    InitialStop
+    Breakeven
+    TrailingStop
+    Other
+
 //============================================================================== 
 // 3. INPUTS
 //============================================================================== 
@@ -266,6 +336,7 @@ string GROUP_SMART_MONEY_SCORE = "18. Smart Money Score"
 string GROUP_TRADE_SCORING = "19. Trade Scoring Engine"
 string GROUP_TRADE_SCORING_VISUALS = "20. Trade Scoring Visuals"
 string GROUP_RISK_MANAGEMENT = "21. M8 — Risk Management"
+string GROUP_TRADE_MANAGEMENT = "22. M9 — Trade Management"
 
 bool enabled = input.bool(true, "Enable strategy", group = GROUP_GENERAL)
 string expectedSymbol = input.string("XAUUSD", "Expected symbol", group = GROUP_GENERAL)
@@ -451,6 +522,33 @@ int maximumConsecutiveLosses = input.int(2, "Maximum Consecutive Losses", minval
 bool sessionRiskGuardEnabled = input.bool(true, "Enable Session Risk Guard", group = GROUP_RISK_MANAGEMENT)
 float maximumSessionRiskPercent = input.float(2.0, "Maximum Session Risk %", minval = 0.1, maxval = 10.0, group = GROUP_RISK_MANAGEMENT)
 bool resetGuardsOnNewSession = input.bool(true, "Reset Guards On New Session", group = GROUP_RISK_MANAGEMENT)
+bool tradeExecutionEnabled = input.bool(false, "Enable Trade Execution", group = GROUP_TRADE_MANAGEMENT)
+EntryMode entryMode = input.enum(EntryMode.MarketOnApproval, "Entry Mode", group = GROUP_TRADE_MANAGEMENT)
+bool allowLongTrades = input.bool(true, "Allow Long Trades", group = GROUP_TRADE_MANAGEMENT)
+bool allowShortTrades = input.bool(true, "Allow Short Trades", group = GROUP_TRADE_MANAGEMENT)
+bool allowOnePositionAtATime = input.bool(true, "Allow One Position At A Time", group = GROUP_TRADE_MANAGEMENT)
+bool cancelPendingSetupOnSessionEnd = input.bool(true, "Cancel Pending Setup On Session End", group = GROUP_TRADE_MANAGEMENT)
+bool useTp1 = input.bool(true, "Use TP1", group = GROUP_TRADE_MANAGEMENT)
+bool useTp2 = input.bool(true, "Use TP2", group = GROUP_TRADE_MANAGEMENT)
+float tp1QuantityPercent = input.float(50.0, "TP1 Quantity %", minval = 0.0, maxval = 100.0, group = GROUP_TRADE_MANAGEMENT)
+float tp2QuantityPercent = input.float(50.0, "TP2 Quantity %", minval = 0.0, maxval = 100.0, group = GROUP_TRADE_MANAGEMENT)
+bool breakevenEnabled = input.bool(true, "Enable Breakeven", group = GROUP_TRADE_MANAGEMENT)
+BreakevenTriggerMode breakevenTriggerMode = input.enum(BreakevenTriggerMode.TP1Hit, "Breakeven Trigger Mode", group = GROUP_TRADE_MANAGEMENT)
+float breakevenTriggerR = input.float(1.0, "Breakeven Trigger R", minval = 0.1, group = GROUP_TRADE_MANAGEMENT)
+BreakevenOffsetMode breakevenOffsetMode = input.enum(BreakevenOffsetMode.ExactEntry, "Breakeven Offset Mode", group = GROUP_TRADE_MANAGEMENT)
+float breakevenOffsetValue = input.float(0.0, "Breakeven Offset Value", minval = 0.0, group = GROUP_TRADE_MANAGEMENT)
+bool applyBreakevenAfterTp1 = input.bool(true, "Apply Breakeven After TP1", group = GROUP_TRADE_MANAGEMENT)
+bool trailingStopEnabled = input.bool(false, "Enable Trailing Stop", group = GROUP_TRADE_MANAGEMENT)
+TrailingStopMode trailingStopMode = input.enum(TrailingStopMode.None, "Trailing Stop Mode", group = GROUP_TRADE_MANAGEMENT)
+TrailingActivationMode trailingActivationMode = input.enum(TrailingActivationMode.AfterTP1, "Trailing Activation Mode", group = GROUP_TRADE_MANAGEMENT)
+float trailingActivationR = input.float(1.0, "Trailing Activation R", minval = 0.1, group = GROUP_TRADE_MANAGEMENT)
+float atrTrailMultiplier = input.float(2.0, "ATR Trail Multiplier", minval = 0.1, group = GROUP_TRADE_MANAGEMENT)
+int chandelierLength = input.int(22, "Chandelier Length", minval = 1, group = GROUP_TRADE_MANAGEMENT)
+float chandelierAtrMultiplier = input.float(3.0, "Chandelier ATR Multiplier", minval = 0.1, group = GROUP_TRADE_MANAGEMENT)
+int superTrendAtrLength = input.int(10, "SuperTrend ATR Length", minval = 1, group = GROUP_TRADE_MANAGEMENT)
+float superTrendFactor = input.float(3.0, "SuperTrend Factor", minval = 0.1, group = GROUP_TRADE_MANAGEMENT)
+int swingTrailPivotLength = input.int(5, "Swing Trail Pivot Length", minval = 1, group = GROUP_TRADE_MANAGEMENT)
+float swingTrailBuffer = input.float(0.0, "Swing Trail Buffer (Ticks)", minval = 0.0, group = GROUP_TRADE_MANAGEMENT)
 
 //============================================================================== 
 // 4. STATE MODELS
@@ -744,6 +842,74 @@ var RiskBlockReason riskBlockReason = RiskBlockReason.None
 var string riskDirectionDashboardText = "None"
 var string riskStopSourceDashboardText = "None"
 var string riskBlockReasonDashboardText = "None"
+var bool tradeActive = false
+var TradeBias activeTradeDirection = TradeBias.None
+var float tradePlannedEntry = na
+var float tradeActualEntry = na
+var float tradeInitialStop = na
+var float tradeTP1 = na
+var float tradeTP2 = na
+var float tradeTP1QuantityPercent = na
+var float tradeTP2QuantityPercent = na
+var float tradeInitialQuantity = na
+var int tradeEntryBarIndex = na
+var bool tradeTP1Hit = false
+var bool tradeTP2Hit = false
+var bool tradeStopHit = false
+var bool tradeTP1HitEvent = false
+var bool tradeTP2HitEvent = false
+var bool tradeStopHitEvent = false
+var float tradeRemainingQuantity = na
+var float tradeTP1Quantity = na
+var float tradeTP2Quantity = na
+var int tradeTP1BarIndex = na
+var int tradeTP2BarIndex = na
+var bool tradeQuantityMismatch = false
+var bool tradeResidualProtected = false
+var bool breakevenActivated = false
+var float activeTradeStop = na
+var float tradeEffectiveStop = na
+var int breakevenActivationBar = na
+var bool tradeBreakevenHit = false
+var bool tradeBreakevenHitEvent = false
+var bool trailingActivated = false
+var bool trailingActivatedEvent = false
+var float trailingStopPrice = na
+var int trailingActivationBar = na
+var bool trailingStopUpdatedEvent = false
+var bool tradeTrailingStopHit = false
+var bool tradeTrailingStopHitEvent = false
+var ActiveStopMode activeStopMode = ActiveStopMode.Initial
+var float latestTrailingSwingLow = na
+var float latestTrailingSwingHigh = na
+var int latestTrailingSwingLowBar = na
+var int latestTrailingSwingHighBar = na
+var int lastProcessedClosedTradeCount = 0
+var float activeTradeRealizedProfit = 0.0
+var int activeTradeClosedLegCount = 0
+var string activeTradeEntryId = ""
+var float tradeInitialCashRisk = na
+var float tradeInitialEquity = na
+var float lastTradeProfit = na
+var float lastTradeProfitPercent = na
+var float lastTradeRMultiple = na
+var float lastTradeEntryPrice = na
+var float lastTradeExitPrice = na
+var int lastTradeEntryBar = na
+var int lastTradeExitBar = na
+var string lastTradeEntryId = ""
+var string lastTradeExitId = ""
+var TradeOutcome lastTradeOutcome = TradeOutcome.None
+var TradeExitReason lastTradeExitReason = TradeExitReason.None
+var bool tradeClosedEvent = false
+var bool tradeWinEvent = false
+var bool tradeLossEvent = false
+var bool tradeBreakevenEvent = false
+var int dailyExecutedTradeCount = 0
+var int sessionExecutedTradeCount = 0
+var int totalExecutedTradeCount = 0
+var float dailyRealizedTradeProfit = 0.0
+var float sessionRealizedTradeProfit = 0.0
 var bool priceAbovePDH = false
 var bool priceBelowPDL = false
 var bool priceAbovePWH = false
@@ -823,6 +989,18 @@ TradeBiasText(series TradeBias bias) =>
 // Returns a readable label for every M7 setup-strength classification.
 TradeSetupStrengthText(series TradeSetupStrength strength) =>
     strength == TradeSetupStrength.Extreme ? "Extreme" : strength == TradeSetupStrength.Strong ? "Strong" : strength == TradeSetupStrength.Normal ? "Normal" : "Weak"
+
+// Returns a readable label for an M9-E realized-trade outcome.
+TradeOutcomeText(series TradeOutcome outcome) =>
+    outcome == TradeOutcome.Win ? "Win" : outcome == TradeOutcome.Loss ? "Loss" : outcome == TradeOutcome.Breakeven ? "Breakeven" : "None"
+
+// Returns a readable label for the final known M9 exit context.
+TradeExitReasonText(series TradeExitReason reason) =>
+    reason == TradeExitReason.TP1 ? "TP1" : reason == TradeExitReason.TP2 ? "TP2" : reason == TradeExitReason.InitialStop ? "Initial Stop" : reason == TradeExitReason.Breakeven ? "Breakeven" : reason == TradeExitReason.TrailingStop ? "Trailing Stop" : reason == TradeExitReason.Other ? "Other" : "None"
+
+// Returns a readable label for the M9 source that last improved the stop.
+ActiveStopModeText(series ActiveStopMode mode) =>
+    mode == ActiveStopMode.Breakeven ? "Breakeven" : mode == ActiveStopMode.ATRTrail ? "ATR Trail" : mode == ActiveStopMode.Chandelier ? "Chandelier" : mode == ActiveStopMode.SuperTrend ? "SuperTrend" : mode == ActiveStopMode.Swing ? "Swing" : "Initial"
 
 // Formats a nullable decimal value for the dashboard without displaying na.
 FormatValueOrDash(float value) =>
@@ -1208,7 +1386,7 @@ CalculateTrendLabel(label previousLabel) =>
 //============================================================================== 
 // 11. DASHBOARD AND DEBUG
 //============================================================================== 
-var table dashboard = table.new(position.top_right, 2, 92, border_width = 1)
+var table dashboard = table.new(position.top_right, 2, 116, border_width = 1)
 var table debugTable = table.new(position.bottom_right, 2, 6, border_width = 1)
 
 // Writes one consistently styled dashboard row.
@@ -1312,8 +1490,32 @@ UpdateDashboard() =>
             SetDashboardRow(dashboard, 89, "Consecutive losses", str.tostring(consecutiveLossCount))
             SetDashboardRow(dashboard, 90, "Risk guard pass", riskGuardPass ? "Yes" : "No")
             SetDashboardRow(dashboard, 91, "Risk block reason", riskBlockReasonDashboardText)
+            SetDashboardRow(dashboard, 92, "Trade active", tradeActive ? "Yes" : "No")
+            SetDashboardRow(dashboard, 93, "Active direction", TradeBiasText(activeTradeDirection))
+            SetDashboardRow(dashboard, 94, "Planned entry", FormatValueOrDash(tradePlannedEntry))
+            SetDashboardRow(dashboard, 95, "Actual entry", FormatValueOrDash(tradeActualEntry))
+            SetDashboardRow(dashboard, 96, "Initial stop", FormatValueOrDash(tradeInitialStop))
+            SetDashboardRow(dashboard, 97, "Effective stop", FormatValueOrDash(tradeEffectiveStop))
+            SetDashboardRow(dashboard, 98, "Active stop mode", ActiveStopModeText(activeStopMode))
+            SetDashboardRow(dashboard, 99, "Trade TP1", FormatValueOrDash(tradeTP1))
+            SetDashboardRow(dashboard, 100, "Trade TP2", FormatValueOrDash(tradeTP2))
+            SetDashboardRow(dashboard, 101, "TP1 hit", tradeTP1Hit ? "Yes" : "No")
+            SetDashboardRow(dashboard, 102, "TP2 hit", tradeTP2Hit ? "Yes" : "No")
+            SetDashboardRow(dashboard, 103, "Breakeven active", breakevenActivated ? "Yes" : "No")
+            SetDashboardRow(dashboard, 104, "Trailing active", trailingActivated ? "Yes" : "No")
+            SetDashboardRow(dashboard, 105, "Remaining quantity", FormatValueOrDash(tradeRemainingQuantity))
+            SetDashboardRow(dashboard, 106, "Last trade outcome", TradeOutcomeText(lastTradeOutcome))
+            SetDashboardRow(dashboard, 107, "Last trade profit", FormatValueOrDash(lastTradeProfit))
+            SetDashboardRow(dashboard, 108, "Last trade R", FormatValueOrDash(lastTradeRMultiple))
+            SetDashboardRow(dashboard, 109, "Last exit reason", TradeExitReasonText(lastTradeExitReason))
+            SetDashboardRow(dashboard, 110, "Daily executed trades", str.tostring(dailyExecutedTradeCount))
+            SetDashboardRow(dashboard, 111, "Session executed trades", str.tostring(sessionExecutedTradeCount))
+            SetDashboardRow(dashboard, 112, "Total executed trades", str.tostring(totalExecutedTradeCount))
+            SetDashboardRow(dashboard, 113, "Daily realized P/L", FormatValueOrDash(dailyRealizedTradeProfit))
+            SetDashboardRow(dashboard, 114, "Session realized P/L", FormatValueOrDash(sessionRealizedTradeProfit))
+            SetDashboardRow(dashboard, 115, "Last trade P/L %", FormatPercent(lastTradeProfitPercent))
         else
-            table.clear(dashboard, 0, 0, 1, 91)
+            table.clear(dashboard, 0, 0, 1, 115)
 
 // Updates the diagnostic panel only on the last chart bar when debugging is enabled.
 UpdateDebugPanel() =>
@@ -2477,11 +2679,15 @@ if na(dailyStartEquity) or newRiskDay
     dailyStartEquity := strategy.equity
     dailyAllocatedRisk := 0.0
     dailyApprovedSetupCount := 0
+    dailyExecutedTradeCount := 0
+    dailyRealizedTradeProfit := 0.0
 if na(sessionStartEquity) or (resetGuardsOnNewSession and sessionState.justStarted)
     sessionStartEquity := strategy.equity
     if resetGuardsOnNewSession and sessionState.justStarted
         sessionAllocatedRisk := 0.0
         sessionApprovedSetupCount := 0
+        sessionExecutedTradeCount := 0
+        sessionRealizedTradeProfit := 0.0
 dailyPnL := not na(dailyStartEquity) ? strategy.equity - dailyStartEquity : na
 dailyPnLPercent := not na(dailyStartEquity) and dailyStartEquity > 0.0 ? dailyPnL * 100.0 / dailyStartEquity : na
 dailyAllocatedRiskPercent := not na(dailyStartEquity) and dailyStartEquity > 0.0 ? dailyAllocatedRisk * 100.0 / dailyStartEquity : na
@@ -2491,7 +2697,7 @@ bool dailyBaselineValid = not na(dailyStartEquity) and dailyStartEquity > 0.0
 bool sessionBaselineValid = not na(sessionStartEquity) and sessionStartEquity > 0.0
 dailyRiskBudgetAvailable := not dailyRiskGuardEnabled or dailyBaselineValid and dailyAllocatedRisk + pendingApprovedRisk <= dailyStartEquity * maximumDailyRiskPercent * 0.01
 dailyLossLimitPass := not dailyRiskGuardEnabled or not na(dailyPnLPercent) and dailyPnLPercent > -maximumDailyLossPercent
-dailyTradeCountPass := not dailyRiskGuardEnabled or dailyApprovedSetupCount < maximumTradesPerDay
+dailyTradeCountPass := not dailyRiskGuardEnabled or (tradeExecutionEnabled ? dailyExecutedTradeCount : dailyApprovedSetupCount) < maximumTradesPerDay
 // M8 intentionally leaves this at zero. Only M9 can safely incorporate
 // realized closed-trade outcomes; setup/retest failures are not losses here.
 consecutiveLossLimitPass := not dailyRiskGuardEnabled or consecutiveLossCount < maximumConsecutiveLosses
@@ -2527,6 +2733,376 @@ if bullishRiskApprovedEvent or bearishRiskApprovedEvent
 // coercion through UpdateDashboard.
 riskDirectionDashboardText := riskDirection == TradeBias.Bullish ? "Bullish" : riskDirection == TradeBias.Bearish ? "Bearish" : "None"
 riskStopSourceDashboardText := riskStopSource == StopSource.ATR ? "ATR" : riskStopSource == StopSource.Swing ? "Swing" : riskStopSource == StopSource.OpeningRange ? "Opening Range" : riskStopSource == StopSource.Retest ? "Retest" : riskStopSource == StopSource.Conservative ? "Conservative" : "None"
+riskBlockReasonDashboardText := riskBlockReason == RiskBlockReason.DailyRisk ? "Daily Risk" : riskBlockReason == RiskBlockReason.DailyLoss ? "Daily Loss" : riskBlockReason == RiskBlockReason.TradeCount ? "Trade Count" : riskBlockReason == RiskBlockReason.ConsecutiveLosses ? "Consecutive Losses" : riskBlockReason == RiskBlockReason.SessionRisk ? "Session Risk" : riskBlockReason == RiskBlockReason.Multiple ? "Multiple" : "None"
+
+//==============================================================================
+// 24. M9-A ENTRY EXECUTION AND INITIAL PROTECTIVE ORDERS
+//==============================================================================
+// M9-A consumes only one-bar final M8 approvals. It records the planned M8
+// reference separately from TradingView's actual fill price and never changes
+// the initial stop or targets after submission.
+float previousPositionSize = nz(strategy.position_size[1], 0.0)
+bool longPositionOpened = strategy.position_size > 0.0 and previousPositionSize <= 0.0
+bool shortPositionOpened = strategy.position_size < 0.0 and previousPositionSize >= 0.0
+bool positionClosedEvent = strategy.position_size == 0.0 and previousPositionSize != 0.0
+bool tradeEntryEvent = longPositionOpened or shortPositionOpened
+if longPositionOpened
+    tradeActive := true
+    activeTradeDirection := TradeBias.Bullish
+    tradeActualEntry := strategy.position_avg_price
+else if shortPositionOpened
+    tradeActive := true
+    activeTradeDirection := TradeBias.Bearish
+    tradeActualEntry := strategy.position_avg_price
+else if strategy.position_size != 0.0
+    tradeActive := true
+    tradeActualEntry := strategy.position_avg_price
+else if positionClosedEvent
+    tradeActive := false
+    activeTradeDirection := TradeBias.None
+    tradeActualEntry := na
+
+// A new actual fill starts a fresh breakeven lifecycle. Initial-stop context
+// remains immutable for risk and later outcome modules.
+if tradeEntryEvent
+    breakevenActivated := false
+    activeTradeStop := tradeInitialStop
+    breakevenActivationBar := na
+    tradeBreakevenHit := false
+    tradeBreakevenHitEvent := false
+    trailingActivated := false
+    trailingActivatedEvent := false
+    trailingStopPrice := na
+    trailingActivationBar := na
+    trailingStopUpdatedEvent := false
+    tradeTrailingStopHit := false
+    tradeTrailingStopHitEvent := false
+    activeStopMode := ActiveStopMode.Initial
+    activeTradeRealizedProfit := 0.0
+    activeTradeClosedLegCount := 0
+    activeTradeEntryId := longPositionOpened ? "LONG" : "SHORT"
+    tradeInitialCashRisk := not na(riskCashAmount) and riskCashAmount > 0.0 ? riskCashAmount : na
+    tradeInitialEquity := strategy.equity
+    dailyExecutedTradeCount += 1
+    sessionExecutedTradeCount += 1
+    totalExecutedTradeCount += 1
+
+// Both M9-A entry modes submit at approval close because the strategy is
+// configured with process_orders_on_close. No limit/retest entry is introduced.
+bool entryModeSupported = entryMode == EntryMode.MarketOnApproval or entryMode == EntryMode.ApprovalClose
+bool dualRiskApprovalEvent = bullishRiskApprovedEvent and bearishRiskApprovedEvent
+// Pyramiding remains zero and M9-A never reverses an active position. The
+// optional one-position setting also guards transient tracked trade state.
+bool onePositionGatePass = strategy.position_size == 0.0 and (not allowOnePositionAtATime or not tradeActive)
+bool targetAllocationValid = not (useTp1 and useTp2) or tp1QuantityPercent > 0.0 and tp2QuantityPercent > 0.0 and math.abs(tp1QuantityPercent + tp2QuantityPercent - 100.0) <= 0.000001
+bool longStopAndTargetValid = not na(riskEntryPrice) and not na(riskStopPrice) and riskStopPrice < riskEntryPrice and (not useTp1 or not na(riskTP1) and riskEntryPrice < riskTP1) and (not useTp2 or not na(riskTP2) and riskEntryPrice < riskTP2) and (not (useTp1 and useTp2) or riskTP1 < riskTP2)
+bool shortStopAndTargetValid = not na(riskEntryPrice) and not na(riskStopPrice) and riskStopPrice > riskEntryPrice and (not useTp1 or not na(riskTP1) and riskEntryPrice > riskTP1) and (not useTp2 or not na(riskTP2) and riskEntryPrice > riskTP2) and (not (useTp1 and useTp2) or riskTP1 > riskTP2)
+bool longEntryAllowed = tradeExecutionEnabled and entryModeSupported and allowLongTrades and not dualRiskApprovalEvent and bullishRiskApprovedEvent and riskApproved and bullishRiskApproved and riskDirection == TradeBias.Bullish and not na(riskQuantity) and riskQuantity > 0.0 and longStopAndTargetValid and targetAllocationValid and onePositionGatePass
+bool shortEntryAllowed = tradeExecutionEnabled and entryModeSupported and allowShortTrades and not dualRiskApprovalEvent and bearishRiskApprovedEvent and riskApproved and bearishRiskApproved and riskDirection == TradeBias.Bearish and not na(riskQuantity) and riskQuantity > 0.0 and shortStopAndTargetValid and targetAllocationValid and onePositionGatePass
+
+if cancelPendingSetupOnSessionEnd and sessionState.justEnded and strategy.position_size == 0.0
+    strategy.cancel("LONG")
+    strategy.cancel("SHORT")
+if longEntryAllowed
+    strategy.entry("LONG", strategy.long, qty = riskQuantity)
+    if useTp1 and useTp2
+        strategy.exit("L-TP1", from_entry = "LONG", stop = riskStopPrice, limit = riskTP1, qty_percent = tp1QuantityPercent)
+        strategy.exit("L-TP2", from_entry = "LONG", stop = riskStopPrice, limit = riskTP2, qty_percent = tp2QuantityPercent)
+    else if useTp1
+        strategy.exit("L-TP1", from_entry = "LONG", stop = riskStopPrice, limit = riskTP1, qty_percent = 100.0)
+    else if useTp2
+        strategy.exit("L-TP2", from_entry = "LONG", stop = riskStopPrice, limit = riskTP2, qty_percent = 100.0)
+    else
+        strategy.exit("L-SL", from_entry = "LONG", stop = riskStopPrice, qty_percent = 100.0)
+    tradePlannedEntry := riskEntryPrice
+    tradeInitialStop := riskStopPrice
+    tradeTP1 := useTp1 ? riskTP1 : na
+    tradeTP2 := useTp2 ? riskTP2 : na
+    tradeTP1QuantityPercent := useTp1 and useTp2 ? tp1QuantityPercent : useTp1 ? 100.0 : 0.0
+    tradeTP2QuantityPercent := useTp1 and useTp2 ? tp2QuantityPercent : useTp2 ? 100.0 : 0.0
+    tradeInitialQuantity := riskQuantity
+    tradeEntryBarIndex := bar_index
+    activeTradeDirection := TradeBias.Bullish
+else if shortEntryAllowed
+    strategy.entry("SHORT", strategy.short, qty = riskQuantity)
+    if useTp1 and useTp2
+        strategy.exit("S-TP1", from_entry = "SHORT", stop = riskStopPrice, limit = riskTP1, qty_percent = tp1QuantityPercent)
+        strategy.exit("S-TP2", from_entry = "SHORT", stop = riskStopPrice, limit = riskTP2, qty_percent = tp2QuantityPercent)
+    else if useTp1
+        strategy.exit("S-TP1", from_entry = "SHORT", stop = riskStopPrice, limit = riskTP1, qty_percent = 100.0)
+    else if useTp2
+        strategy.exit("S-TP2", from_entry = "SHORT", stop = riskStopPrice, limit = riskTP2, qty_percent = 100.0)
+    else
+        strategy.exit("S-SL", from_entry = "SHORT", stop = riskStopPrice, qty_percent = 100.0)
+    tradePlannedEntry := riskEntryPrice
+    tradeInitialStop := riskStopPrice
+    tradeTP1 := useTp1 ? riskTP1 : na
+    tradeTP2 := useTp2 ? riskTP2 : na
+    tradeTP1QuantityPercent := useTp1 and useTp2 ? tp1QuantityPercent : useTp1 ? 100.0 : 0.0
+    tradeTP2QuantityPercent := useTp1 and useTp2 ? tp2QuantityPercent : useTp2 ? 100.0 : 0.0
+    tradeInitialQuantity := riskQuantity
+    tradeEntryBarIndex := bar_index
+    activeTradeDirection := TradeBias.Bearish
+
+//==============================================================================
+// 25. M9-B PARTIAL TARGET LIFECYCLE AND RESIDUAL PROTECTION
+//==============================================================================
+// Position size is the authoritative fill source. Price is consulted only on
+// an actual closure through strategy.closedtrades, never from candle touches.
+tradeTP1HitEvent := false
+tradeTP2HitEvent := false
+tradeStopHitEvent := false
+tradeBreakevenHitEvent := false
+float currentPositionQuantity = math.abs(strategy.position_size)
+float quantityTolerance = math.max(quantityStep, 0.000001)
+float lastClosedExitPrice = positionClosedEvent and strategy.closedtrades > 0 ? strategy.closedtrades.exit_price(strategy.closedtrades - 1) : na
+if tradeEntryEvent
+    tradeTP1Hit := false
+    tradeTP2Hit := false
+    tradeStopHit := false
+    tradeRemainingQuantity := currentPositionQuantity
+    tradeTP1Quantity := not na(tradeTP1) and not na(tradeTP1QuantityPercent) ? currentPositionQuantity * tradeTP1QuantityPercent * 0.01 : 0.0
+    tradeTP2Quantity := not na(tradeTP2) and not na(tradeTP2QuantityPercent) ? currentPositionQuantity * tradeTP2QuantityPercent * 0.01 : 0.0
+    tradeTP1BarIndex := na
+    tradeTP2BarIndex := na
+    tradeQuantityMismatch := not na(tradeInitialQuantity) and math.abs(currentPositionQuantity - tradeInitialQuantity) > quantityTolerance
+else if tradeActive
+    tradeRemainingQuantity := currentPositionQuantity
+
+// A TP1 event requires an actual remaining-position reduction approximately
+// equal to its frozen allocation. It cannot be triggered by a price wick.
+float positionQuantityReduction = math.max(math.abs(previousPositionSize) - currentPositionQuantity, 0.0)
+bool partialPositionReduction = tradeActive and currentPositionQuantity > quantityTolerance and positionQuantityReduction > quantityTolerance
+bool tp1PartialFillDetected = partialPositionReduction and not tradeTP1Hit and not na(tradeTP1Quantity) and tradeTP1Quantity > 0.0 and positionQuantityReduction >= tradeTP1Quantity - quantityTolerance
+if tp1PartialFillDetected
+    tradeTP1Hit := true
+    tradeTP1HitEvent := true
+    tradeTP1BarIndex := bar_index
+
+// A closure is classified only when TradingView reports an exit price near a
+// frozen target or stop. Both targets can be marked on one closure bar when a
+// fast bar/gap traverses TP2 and the TP1 portion was not separately observable.
+bool closedAtTP1 = positionClosedEvent and not na(lastClosedExitPrice) and not na(tradeTP1) and math.abs(lastClosedExitPrice - tradeTP1) <= syminfo.mintick * 2.0
+bool closedAtTP2 = positionClosedEvent and not na(lastClosedExitPrice) and not na(tradeTP2) and math.abs(lastClosedExitPrice - tradeTP2) <= syminfo.mintick * 2.0
+float stopDiagnosticPrice = not na(activeTradeStop) ? activeTradeStop : tradeInitialStop
+bool closedAtEffectiveStop = positionClosedEvent and not na(lastClosedExitPrice) and not na(stopDiagnosticPrice) and math.abs(lastClosedExitPrice - stopDiagnosticPrice) <= syminfo.mintick * 2.0
+if positionClosedEvent
+    tradeRemainingQuantity := 0.0
+    if closedAtTP2
+        if not na(tradeTP1) and not tradeTP1Hit
+            tradeTP1Hit := true
+            tradeTP1HitEvent := true
+            tradeTP1BarIndex := bar_index
+        if not tradeTP2Hit
+            tradeTP2Hit := true
+            tradeTP2HitEvent := true
+            tradeTP2BarIndex := bar_index
+    else if closedAtTP1 and na(tradeTP2) and not tradeTP1Hit
+        tradeTP1Hit := true
+        tradeTP1HitEvent := true
+        tradeTP1BarIndex := bar_index
+    else if closedAtEffectiveStop and not tradeStopHit
+        tradeStopHit := true
+        tradeStopHitEvent := true
+tradeResidualProtected := tradeActive and currentPositionQuantity > quantityTolerance and not na(activeTradeStop)
+
+//==============================================================================
+// 26. M9-C BREAKEVEN MANAGEMENT AND RESIDUAL STOP PROTECTION
+//==============================================================================
+// M9-C changes only the active protective stop after a verified trigger. It
+// never changes the original risk stop, target allocations, or target prices.
+float breakevenReferencePrice = not na(tradeActualEntry) ? tradeActualEntry : tradePlannedEntry
+float breakevenOffset = breakevenOffsetMode == BreakevenOffsetMode.Ticks ? breakevenOffsetValue * syminfo.mintick : breakevenOffsetMode == BreakevenOffsetMode.ATR and not na(atrValue) ? breakevenOffsetValue * atrValue : 0.0
+float breakevenStopPrice = activeTradeDirection == TradeBias.Bullish and not na(breakevenReferencePrice) ? breakevenReferencePrice + breakevenOffset : activeTradeDirection == TradeBias.Bearish and not na(breakevenReferencePrice) ? breakevenReferencePrice - breakevenOffset : na
+float initialTradeRiskDistance = not na(breakevenReferencePrice) and not na(tradeInitialStop) ? math.abs(breakevenReferencePrice - tradeInitialStop) : na
+bool residualPositionOpen = tradeActive and strategy.position_size != 0.0 and currentPositionQuantity > quantityTolerance and not positionClosedEvent
+bool tp1BreakevenTrigger = breakevenTriggerMode == BreakevenTriggerMode.TP1Hit and applyBreakevenAfterTp1 and tradeTP1Hit and residualPositionOpen
+bool longRMultipleTrigger = breakevenTriggerMode == BreakevenTriggerMode.RMultiple and residualPositionOpen and activeTradeDirection == TradeBias.Bullish and barstate.isconfirmed and not na(breakevenReferencePrice) and not na(initialTradeRiskDistance) and initialTradeRiskDistance > 0.0 and close - breakevenReferencePrice >= initialTradeRiskDistance * breakevenTriggerR
+bool shortRMultipleTrigger = breakevenTriggerMode == BreakevenTriggerMode.RMultiple and residualPositionOpen and activeTradeDirection == TradeBias.Bearish and barstate.isconfirmed and not na(breakevenReferencePrice) and not na(initialTradeRiskDistance) and initialTradeRiskDistance > 0.0 and breakevenReferencePrice - close >= initialTradeRiskDistance * breakevenTriggerR
+bool breakevenTriggerCondition = breakevenEnabled and not breakevenActivated and (tp1BreakevenTrigger or longRMultipleTrigger or shortRMultipleTrigger)
+bool longBreakevenStopValid = activeTradeDirection == TradeBias.Bullish and not na(breakevenReferencePrice) and not na(breakevenStopPrice) and not na(tradeInitialStop) and breakevenStopPrice >= breakevenReferencePrice and breakevenStopPrice < close and breakevenStopPrice > tradeInitialStop and (na(activeTradeStop) or breakevenStopPrice > activeTradeStop) and (na(tradeTP2) or breakevenStopPrice < tradeTP2)
+bool shortBreakevenStopValid = activeTradeDirection == TradeBias.Bearish and not na(breakevenReferencePrice) and not na(breakevenStopPrice) and not na(tradeInitialStop) and breakevenStopPrice <= breakevenReferencePrice and breakevenStopPrice > close and breakevenStopPrice < tradeInitialStop and (na(activeTradeStop) or breakevenStopPrice < activeTradeStop) and (na(tradeTP2) or breakevenStopPrice > tradeTP2)
+bool breakevenStopValid = longBreakevenStopValid or shortBreakevenStopValid
+bool breakevenActivatedEvent = false
+
+if breakevenTriggerCondition and breakevenStopValid
+    breakevenActivated := true
+    activeTradeStop := activeTradeDirection == TradeBias.Bullish ? na(activeTradeStop) ? breakevenStopPrice : math.max(activeTradeStop, breakevenStopPrice) : na(activeTradeStop) ? breakevenStopPrice : math.min(activeTradeStop, breakevenStopPrice)
+    breakevenActivationBar := bar_index
+    breakevenActivatedEvent := true
+    activeStopMode := ActiveStopMode.Breakeven
+
+// Update only the remaining reservation. TP1 is never recreated after a fill.
+if breakevenActivatedEvent and residualPositionOpen and not na(activeTradeStop)
+    if activeTradeDirection == TradeBias.Bullish
+        if not na(tradeTP1) and not tradeTP1Hit and not na(tradeTP1QuantityPercent) and tradeTP1QuantityPercent > 0.0
+            strategy.exit("L-TP1", from_entry = "LONG", stop = activeTradeStop, limit = tradeTP1, qty_percent = tradeTP1QuantityPercent)
+        if not na(tradeTP2) and not na(tradeTP2QuantityPercent) and tradeTP2QuantityPercent > 0.0
+            strategy.exit("L-TP2", from_entry = "LONG", stop = activeTradeStop, limit = tradeTP2, qty_percent = tradeTP2QuantityPercent)
+        else if na(tradeTP1)
+            strategy.exit("L-SL", from_entry = "LONG", stop = activeTradeStop, qty_percent = 100.0)
+    else if activeTradeDirection == TradeBias.Bearish
+        if not na(tradeTP1) and not tradeTP1Hit and not na(tradeTP1QuantityPercent) and tradeTP1QuantityPercent > 0.0
+            strategy.exit("S-TP1", from_entry = "SHORT", stop = activeTradeStop, limit = tradeTP1, qty_percent = tradeTP1QuantityPercent)
+        if not na(tradeTP2) and not na(tradeTP2QuantityPercent) and tradeTP2QuantityPercent > 0.0
+            strategy.exit("S-TP2", from_entry = "SHORT", stop = activeTradeStop, limit = tradeTP2, qty_percent = tradeTP2QuantityPercent)
+        else if na(tradeTP1)
+            strategy.exit("S-SL", from_entry = "SHORT", stop = activeTradeStop, qty_percent = 100.0)
+
+tradeEffectiveStop := not na(activeTradeStop) ? activeTradeStop : tradeInitialStop
+bool closedAtBreakevenStop = positionClosedEvent and breakevenActivated and activeStopMode == ActiveStopMode.Breakeven and not na(lastClosedExitPrice) and not na(activeTradeStop) and math.abs(lastClosedExitPrice - activeTradeStop) <= syminfo.mintick * 2.0
+if closedAtBreakevenStop
+    tradeBreakevenHit := true
+    tradeBreakevenHitEvent := true
+
+//==============================================================================
+// 27. M9-D SELECTABLE TRAILING STOP MANAGEMENT
+//==============================================================================
+// Every trailing mode produces one candidate. The selected candidate can only
+// improve activeTradeStop, which is shared with M9-C breakeven management.
+trailingActivatedEvent := false
+trailingStopUpdatedEvent := false
+tradeTrailingStopHitEvent := false
+
+// Pivot values become available only after swingTrailPivotLength right-side
+// bars confirm the turning point. Their stored bar indices prevent using a
+// pivot that predates the current trade lifecycle.
+float confirmedTrailingSwingLow = ta.pivotlow(low, swingTrailPivotLength, swingTrailPivotLength)
+float confirmedTrailingSwingHigh = ta.pivothigh(high, swingTrailPivotLength, swingTrailPivotLength)
+if not na(confirmedTrailingSwingLow)
+    latestTrailingSwingLow := confirmedTrailingSwingLow
+    latestTrailingSwingLowBar := bar_index - swingTrailPivotLength
+if not na(confirmedTrailingSwingHigh)
+    latestTrailingSwingHigh := confirmedTrailingSwingHigh
+    latestTrailingSwingHighBar := bar_index - swingTrailPivotLength
+
+// SuperTrend is evaluated once per bar and uses no higher-timeframe data or
+// lookahead. TradingView reports a negative direction on its bullish side.
+[superTrendLine, superTrendDirection] = ta.supertrend(superTrendFactor, superTrendAtrLength)
+float chandelierHighestHigh = ta.highest(high, chandelierLength)
+float chandelierLowestLow = ta.lowest(low, chandelierLength)
+float atrTrailingCandidate = activeTradeDirection == TradeBias.Bullish and not na(atrValue) ? close - atrValue * atrTrailMultiplier : activeTradeDirection == TradeBias.Bearish and not na(atrValue) ? close + atrValue * atrTrailMultiplier : na
+float chandelierTrailingCandidate = activeTradeDirection == TradeBias.Bullish and not na(atrValue) ? chandelierHighestHigh - atrValue * chandelierAtrMultiplier : activeTradeDirection == TradeBias.Bearish and not na(atrValue) ? chandelierLowestLow + atrValue * chandelierAtrMultiplier : na
+float superTrendTrailingCandidate = activeTradeDirection == TradeBias.Bullish and superTrendDirection < 0 ? superTrendLine : activeTradeDirection == TradeBias.Bearish and superTrendDirection > 0 ? superTrendLine : na
+float swingTrailBufferPrice = swingTrailBuffer * syminfo.mintick
+bool currentTradeHasConfirmedSwingLow = not na(latestTrailingSwingLow) and not na(latestTrailingSwingLowBar) and not na(tradeEntryBarIndex) and latestTrailingSwingLowBar >= tradeEntryBarIndex
+bool currentTradeHasConfirmedSwingHigh = not na(latestTrailingSwingHigh) and not na(latestTrailingSwingHighBar) and not na(tradeEntryBarIndex) and latestTrailingSwingHighBar >= tradeEntryBarIndex
+float swingTrailingCandidate = activeTradeDirection == TradeBias.Bullish and currentTradeHasConfirmedSwingLow ? latestTrailingSwingLow - swingTrailBufferPrice : activeTradeDirection == TradeBias.Bearish and currentTradeHasConfirmedSwingHigh ? latestTrailingSwingHigh + swingTrailBufferPrice : na
+float selectedTrailingCandidate = trailingStopMode == TrailingStopMode.ATR ? atrTrailingCandidate : trailingStopMode == TrailingStopMode.Chandelier ? chandelierTrailingCandidate : trailingStopMode == TrailingStopMode.SuperTrend ? superTrendTrailingCandidate : trailingStopMode == TrailingStopMode.Swing ? swingTrailingCandidate : na
+
+float trailingReferencePrice = not na(tradeActualEntry) ? tradeActualEntry : tradePlannedEntry
+float trailingInitialRiskDistance = not na(trailingReferencePrice) and not na(tradeInitialStop) ? math.abs(trailingReferencePrice - tradeInitialStop) : na
+bool openTrailingPosition = tradeActive and strategy.position_size != 0.0 and currentPositionQuantity > quantityTolerance and not positionClosedEvent and (activeTradeDirection == TradeBias.Bullish or activeTradeDirection == TradeBias.Bearish)
+bool trailingAfterTp1Activation = trailingActivationMode == TrailingActivationMode.AfterTP1 and tradeTP1Hit and openTrailingPosition
+bool trailingLongRMultipleActivation = trailingActivationMode == TrailingActivationMode.RMultiple and activeTradeDirection == TradeBias.Bullish and openTrailingPosition and barstate.isconfirmed and not na(trailingReferencePrice) and not na(trailingInitialRiskDistance) and trailingInitialRiskDistance > 0.0 and close - trailingReferencePrice >= trailingInitialRiskDistance * trailingActivationR
+bool trailingShortRMultipleActivation = trailingActivationMode == TrailingActivationMode.RMultiple and activeTradeDirection == TradeBias.Bearish and openTrailingPosition and barstate.isconfirmed and not na(trailingReferencePrice) and not na(trailingInitialRiskDistance) and trailingInitialRiskDistance > 0.0 and trailingReferencePrice - close >= trailingInitialRiskDistance * trailingActivationR
+bool trailingImmediateActivation = trailingActivationMode == TrailingActivationMode.Immediate and openTrailingPosition and barstate.isconfirmed
+bool trailingActivationCondition = trailingImmediateActivation or trailingAfterTp1Activation or trailingLongRMultipleActivation or trailingShortRMultipleActivation
+bool trailingContextActive = trailingStopEnabled and trailingStopMode != TrailingStopMode.None and openTrailingPosition and barstate.isconfirmed and not na(tradeInitialStop) and not na(activeTradeStop) and (trailingActivated or trailingActivationCondition)
+
+if trailingContextActive and not trailingActivated
+    trailingActivated := true
+    trailingActivatedEvent := true
+    trailingActivationBar := bar_index
+
+// Before TP1, its target is the nearest remaining boundary; after its verified
+// fill, TP2 becomes the remaining target. This keeps every reservation valid.
+float remainingTargetPrice = not tradeTP1Hit and not na(tradeTP1) ? tradeTP1 : tradeTP2
+bool longTrailingCandidateValid = trailingActivated and activeTradeDirection == TradeBias.Bullish and not na(selectedTrailingCandidate) and not na(activeTradeStop) and selectedTrailingCandidate > activeTradeStop and selectedTrailingCandidate < close and (na(remainingTargetPrice) or selectedTrailingCandidate < remainingTargetPrice)
+bool shortTrailingCandidateValid = trailingActivated and activeTradeDirection == TradeBias.Bearish and not na(selectedTrailingCandidate) and not na(activeTradeStop) and selectedTrailingCandidate < activeTradeStop and selectedTrailingCandidate > close and (na(remainingTargetPrice) or selectedTrailingCandidate > remainingTargetPrice)
+bool trailingCandidateValid = longTrailingCandidateValid or shortTrailingCandidateValid
+
+if trailingContextActive and trailingCandidateValid
+    trailingStopPrice := selectedTrailingCandidate
+    activeTradeStop := activeTradeDirection == TradeBias.Bullish ? math.max(activeTradeStop, selectedTrailingCandidate) : math.min(activeTradeStop, selectedTrailingCandidate)
+    activeStopMode := trailingStopMode == TrailingStopMode.ATR ? ActiveStopMode.ATRTrail : trailingStopMode == TrailingStopMode.Chandelier ? ActiveStopMode.Chandelier : trailingStopMode == TrailingStopMode.SuperTrend ? ActiveStopMode.SuperTrend : ActiveStopMode.Swing
+    trailingStopUpdatedEvent := true
+
+// Reuse the original IDs to maintain full stop coverage before TP1 and to
+// protect only the residual target after its verified fill.
+if trailingStopUpdatedEvent and openTrailingPosition and not na(activeTradeStop)
+    if activeTradeDirection == TradeBias.Bullish
+        if not na(tradeTP1) and not tradeTP1Hit and not na(tradeTP1QuantityPercent) and tradeTP1QuantityPercent > 0.0
+            strategy.exit("L-TP1", from_entry = "LONG", stop = activeTradeStop, limit = tradeTP1, qty_percent = tradeTP1QuantityPercent)
+        if not na(tradeTP2) and not na(tradeTP2QuantityPercent) and tradeTP2QuantityPercent > 0.0
+            strategy.exit("L-TP2", from_entry = "LONG", stop = activeTradeStop, limit = tradeTP2, qty_percent = tradeTP2QuantityPercent)
+        else if na(tradeTP1)
+            strategy.exit("L-SL", from_entry = "LONG", stop = activeTradeStop, qty_percent = 100.0)
+    else if activeTradeDirection == TradeBias.Bearish
+        if not na(tradeTP1) and not tradeTP1Hit and not na(tradeTP1QuantityPercent) and tradeTP1QuantityPercent > 0.0
+            strategy.exit("S-TP1", from_entry = "SHORT", stop = activeTradeStop, limit = tradeTP1, qty_percent = tradeTP1QuantityPercent)
+        if not na(tradeTP2) and not na(tradeTP2QuantityPercent) and tradeTP2QuantityPercent > 0.0
+            strategy.exit("S-TP2", from_entry = "SHORT", stop = activeTradeStop, limit = tradeTP2, qty_percent = tradeTP2QuantityPercent)
+        else if na(tradeTP1)
+            strategy.exit("S-SL", from_entry = "SHORT", stop = activeTradeStop, qty_percent = 100.0)
+
+bool closedAtTrailingStop = positionClosedEvent and trailingActivated and (activeStopMode == ActiveStopMode.ATRTrail or activeStopMode == ActiveStopMode.Chandelier or activeStopMode == ActiveStopMode.SuperTrend or activeStopMode == ActiveStopMode.Swing) and not na(lastClosedExitPrice) and not na(activeTradeStop) and math.abs(lastClosedExitPrice - activeTradeStop) <= syminfo.mintick * 2.0
+if closedAtTrailingStop
+    tradeTrailingStopHit := true
+    tradeTrailingStopHitEvent := true
+tradeEffectiveStop := not na(activeTradeStop) ? activeTradeStop : tradeInitialStop
+
+//==============================================================================
+// 28. M9-E REALIZED OUTCOMES AND EXECUTION-BASED GUARD RECONCILIATION
+//==============================================================================
+// Closed-trade records may represent partial exit legs. Each newly reported
+// leg is therefore accumulated by the active entry ID and classified only once
+// the complete position is flat.
+tradeClosedEvent := false
+tradeWinEvent := false
+tradeLossEvent := false
+tradeBreakevenEvent := false
+bool newClosedTradeAvailable = strategy.closedtrades > lastProcessedClosedTradeCount
+bool processedActiveExitLeg = false
+if newClosedTradeAvailable
+    for closedTradeIndex = lastProcessedClosedTradeCount to strategy.closedtrades - 1
+        string closedTradeEntryId = strategy.closedtrades.entry_id(closedTradeIndex)
+        float closedTradeProfit = strategy.closedtrades.profit(closedTradeIndex)
+        if closedTradeEntryId == activeTradeEntryId and activeTradeEntryId != ""
+            activeTradeRealizedProfit += closedTradeProfit
+            activeTradeClosedLegCount += 1
+            processedActiveExitLeg := true
+            lastTradeEntryPrice := strategy.closedtrades.entry_price(closedTradeIndex)
+            lastTradeExitPrice := strategy.closedtrades.exit_price(closedTradeIndex)
+            lastTradeEntryBar := strategy.closedtrades.entry_bar_index(closedTradeIndex)
+            lastTradeExitBar := strategy.closedtrades.exit_bar_index(closedTradeIndex)
+            lastTradeEntryId := closedTradeEntryId
+            lastTradeExitId := strategy.closedtrades.exit_id(closedTradeIndex)
+    lastProcessedClosedTradeCount := strategy.closedtrades
+
+// Final trade diagnostics are emitted only for a complete lifecycle. Account
+// return uses frozen entry equity; R uses the separately frozen cash-risk base.
+if processedActiveExitLeg and strategy.position_size == 0.0 and activeTradeClosedLegCount > 0
+    lastTradeProfit := activeTradeRealizedProfit
+    lastTradeProfitPercent := not na(tradeInitialEquity) and tradeInitialEquity > 0.0 ? activeTradeRealizedProfit * 100.0 / tradeInitialEquity : na
+    lastTradeRMultiple := not na(tradeInitialCashRisk) and tradeInitialCashRisk > 0.0 ? activeTradeRealizedProfit / tradeInitialCashRisk : na
+    bool finalExitAtTP1 = not na(lastTradeExitPrice) and not na(tradeTP1) and math.abs(lastTradeExitPrice - tradeTP1) <= syminfo.mintick * 2.0
+    bool finalExitAtTP2 = not na(lastTradeExitPrice) and not na(tradeTP2) and math.abs(lastTradeExitPrice - tradeTP2) <= syminfo.mintick * 2.0
+    bool finalExitAtEffectiveStop = not na(lastTradeExitPrice) and not na(tradeEffectiveStop) and math.abs(lastTradeExitPrice - tradeEffectiveStop) <= syminfo.mintick * 2.0
+    bool effectiveStopIsTrailing = activeStopMode == ActiveStopMode.ATRTrail or activeStopMode == ActiveStopMode.Chandelier or activeStopMode == ActiveStopMode.SuperTrend or activeStopMode == ActiveStopMode.Swing
+    lastTradeExitReason := finalExitAtTP2 ? TradeExitReason.TP2 : finalExitAtTP1 ? TradeExitReason.TP1 : finalExitAtEffectiveStop and effectiveStopIsTrailing ? TradeExitReason.TrailingStop : finalExitAtEffectiveStop and activeStopMode == ActiveStopMode.Breakeven ? TradeExitReason.Breakeven : finalExitAtEffectiveStop and activeStopMode == ActiveStopMode.Initial ? TradeExitReason.InitialStop : TradeExitReason.Other
+    lastTradeOutcome := activeTradeRealizedProfit > TRADE_PROFIT_TOLERANCE ? TradeOutcome.Win : activeTradeRealizedProfit < -TRADE_PROFIT_TOLERANCE ? TradeOutcome.Loss : TradeOutcome.Breakeven
+    tradeClosedEvent := true
+    tradeWinEvent := lastTradeOutcome == TradeOutcome.Win
+    tradeLossEvent := lastTradeOutcome == TradeOutcome.Loss
+    tradeBreakevenEvent := lastTradeOutcome == TradeOutcome.Breakeven
+    dailyRealizedTradeProfit += activeTradeRealizedProfit
+    sessionRealizedTradeProfit += activeTradeRealizedProfit
+    if lastTradeOutcome == TradeOutcome.Loss
+        consecutiveLossCount += 1
+    else if lastTradeOutcome == TradeOutcome.Win
+        consecutiveLossCount := 0
+
+// M8 retains approval diagnostics, but its trade-count guard now prefers actual
+// entries whenever execution is on. Outcome changes are reflected immediately
+// for subsequent bars and dashboard diagnostics without changing past orders.
+dailyTradeCountPass := not dailyRiskGuardEnabled or (tradeExecutionEnabled ? dailyExecutedTradeCount : dailyApprovedSetupCount) < maximumTradesPerDay
+consecutiveLossLimitPass := not dailyRiskGuardEnabled or consecutiveLossCount < maximumConsecutiveLosses
+riskGuardPass := dailyRiskBudgetAvailable and dailyLossLimitPass and dailyTradeCountPass and consecutiveLossLimitPass and sessionRiskBudgetAvailable
+blockedByTradeCount := dailyRiskGuardEnabled and not dailyTradeCountPass
+blockedByConsecutiveLosses := dailyRiskGuardEnabled and not consecutiveLossLimitPass
+int reconciledRiskBlockCount = (blockedByDailyRisk ? 1 : 0) + (blockedByDailyLoss ? 1 : 0) + (blockedByTradeCount ? 1 : 0) + (blockedByConsecutiveLosses ? 1 : 0) + (blockedBySessionRisk ? 1 : 0)
+riskBlockReason := reconciledRiskBlockCount > 1 ? RiskBlockReason.Multiple : blockedByDailyRisk ? RiskBlockReason.DailyRisk : blockedByDailyLoss ? RiskBlockReason.DailyLoss : blockedByTradeCount ? RiskBlockReason.TradeCount : blockedByConsecutiveLosses ? RiskBlockReason.ConsecutiveLosses : blockedBySessionRisk ? RiskBlockReason.SessionRisk : RiskBlockReason.None
 riskBlockReasonDashboardText := riskBlockReason == RiskBlockReason.DailyRisk ? "Daily Risk" : riskBlockReason == RiskBlockReason.DailyLoss ? "Daily Loss" : riskBlockReason == RiskBlockReason.TradeCount ? "Trade Count" : riskBlockReason == RiskBlockReason.ConsecutiveLosses ? "Consecutive Losses" : riskBlockReason == RiskBlockReason.SessionRisk ? "Session Risk" : riskBlockReason == RiskBlockReason.Multiple ? "Multiple" : "None"
 
 // Dashboard text is formed in the main execution scope. This prevents Pine
