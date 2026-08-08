@@ -1,11 +1,17 @@
 //@version=6
 // XAUUSD Institutional Framework
-// Version: 0.5.0
+// Version: 0.6.0
 //
 // Session and Opening Range engine. Every state mutation happens on confirmed
 // bars, so the engine never uses future values or repainting calculations.
 //
 // Changelog:
+// - 0.6.0: Added M6-A completed daily/weekly context, pivot-confirmed equal
+//          high/low liquidity levels, M6-B liquidity sweep context, and M6-C
+//          bounded Fair Value Gap lifecycle/proximity context, and M6-D basic
+//          Order Block/premium-discount context, directional Smart Money scores,
+//          lightweight M6 visuals, and dashboard integration.
+//          Remaining Smart Money work is deferred.
 // - 0.5.0: Added retest lifecycle, tolerance and penetration controls, retest
 //          windows, pattern/quality confirmation, scoring, close-failure
 //          confirmation, controlled retries, event visuals, and dashboard state.
@@ -18,7 +24,7 @@
 //============================================================================== 
 // 1. STRATEGY DECLARATION
 //============================================================================== 
-strategy("XAUUSD Institutional Framework v0.5.0", "XAUUSD v0.5.0", overlay = true,
+strategy("XAUUSD Institutional Framework v0.6.0", "XAUUSD v0.6.0", overlay = true,
      pyramiding = 0, calc_on_every_tick = false, calc_on_order_fills = false,
      process_orders_on_close = true, initial_capital = 10000, currency = currency.USD,
      default_qty_type = strategy.percent_of_equity, default_qty_value = 1)
@@ -26,7 +32,7 @@ strategy("XAUUSD Institutional Framework v0.5.0", "XAUUSD v0.5.0", overlay = tru
 //============================================================================== 
 // 2. CONSTANTS AND ENUMS
 //============================================================================== 
-string STRATEGY_VERSION = "0.5.0"
+string STRATEGY_VERSION = "0.6.0"
 string DASHBOARD_TITLE = "XAUUSD SESSION ENGINE"
 int MILLISECONDS_PER_MINUTE = 60000
 int ATR_LENGTH = 14
@@ -84,6 +90,61 @@ enum RetestConfirmationMode
     AnyPattern
     Strict
 
+enum EqualLevelToleranceMode
+    Ticks
+    Atr
+    Percentage
+
+enum LiquiditySource
+    None
+    SwingHigh
+    SwingLow
+    EqualHigh
+    EqualLow
+    PreviousDayHigh
+    PreviousDayLow
+    PreviousWeekHigh
+    PreviousWeekLow
+    OpeningRangeHigh
+    OpeningRangeLow
+
+enum SweepStrength
+    Weak
+    Normal
+    Strong
+    Extreme
+
+enum FvgInvalidationMode
+    Midpoint
+    FullFill
+    CloseThrough
+
+enum OrderBlockInvalidationMode
+    WickThrough
+    CloseThrough
+
+enum DealingRangeMode
+    RecentStructure
+    OpeningRange
+    PreviousDay
+
+enum PremiumDiscountState
+    Unknown
+    Premium
+    Equilibrium
+    Discount
+
+enum SmartMoneyBias
+    Bullish
+    Bearish
+    Neutral
+
+enum SmartMoneyStrength
+    Weak
+    Normal
+    Strong
+    Extreme
+
 enum BreakoutBufferMode
     Ticks
     Percentage
@@ -128,6 +189,12 @@ string GROUP_TREND = "9. Trend Engine"
 string GROUP_TREND_VISUALS = "10. Trend Visuals"
 string GROUP_BREAKOUT = "11. Breakout Engine"
 string GROUP_RETEST = "12. Retest Engine"
+string GROUP_SMART_MONEY = "13. Smart Money Engine"
+string GROUP_LIQUIDITY_SWEEPS = "14. Liquidity Sweeps"
+string GROUP_FAIR_VALUE_GAPS = "15. Fair Value Gaps"
+string GROUP_ORDER_BLOCKS = "16. Order Blocks"
+string GROUP_PREMIUM_DISCOUNT = "17. Premium / Discount"
+string GROUP_SMART_MONEY_SCORE = "18. Smart Money Score"
 
 bool enabled = input.bool(true, "Enable strategy", group = GROUP_GENERAL)
 string expectedSymbol = input.string("XAUUSD", "Expected symbol", group = GROUP_GENERAL)
@@ -222,6 +289,46 @@ bool allowMultipleRetestAttempts = input.bool(false, "Allow multiple retest atte
 bool showRetestMarkers = input.bool(true, "Show retest markers", group = GROUP_RETEST)
 bool showRetestScore = input.bool(true, "Show retest score", group = GROUP_RETEST)
 bool showRetestLevel = input.bool(true, "Show retest level", group = GROUP_RETEST)
+bool equalLevelsEnabled = input.bool(true, "Enable Equal Highs/Lows", group = GROUP_SMART_MONEY)
+EqualLevelToleranceMode equalLevelToleranceMode = input.enum(EqualLevelToleranceMode.Atr, "Equal-level tolerance mode", group = GROUP_SMART_MONEY)
+float equalLevelToleranceValue = input.float(0.10, "Equal-level tolerance value", minval = 0.0, group = GROUP_SMART_MONEY)
+int equalLevelMinimumTouches = input.int(2, "Equal-level minimum touches", minval = 2, group = GROUP_SMART_MONEY)
+int equalLevelMaximumAge = input.int(100, "Equal-level maximum age (bars)", minval = 1, group = GROUP_SMART_MONEY)
+bool showPreviousDayLevels = input.bool(true, "Show previous day levels", group = GROUP_SMART_MONEY)
+bool showPreviousWeekLevels = input.bool(true, "Show previous week levels", group = GROUP_SMART_MONEY)
+bool showEqualHighsLows = input.bool(true, "Show Equal Highs/Lows", group = GROUP_SMART_MONEY)
+bool liquiditySweepsEnabled = input.bool(true, "Enable liquidity sweeps", group = GROUP_LIQUIDITY_SWEEPS)
+RetestDistanceMode sweepPenetrationMode = input.enum(RetestDistanceMode.Atr, "Penetration mode", group = GROUP_LIQUIDITY_SWEEPS)
+float minimumSweepPenetrationValue = input.float(0.05, "Minimum sweep penetration", minval = 0.0, group = GROUP_LIQUIDITY_SWEEPS)
+float maximumSweepPenetrationValue = input.float(0.50, "Maximum sweep penetration", minval = 0.0, group = GROUP_LIQUIDITY_SWEEPS)
+bool requireSweepCloseBack = input.bool(true, "Require close back through level", group = GROUP_LIQUIDITY_SWEEPS)
+bool requireSweepRejectionWick = input.bool(true, "Require rejection wick", group = GROUP_LIQUIDITY_SWEEPS)
+float minimumSweepRejectionWickPercent = input.float(35.0, "Minimum rejection wick %", minval = 0.0, maxval = 100.0, group = GROUP_LIQUIDITY_SWEEPS)
+int sweepConfirmationBars = input.int(1, "Sweep confirmation bars", minval = 1, group = GROUP_LIQUIDITY_SWEEPS)
+bool fairValueGapsEnabled = input.bool(true, "Enable Fair Value Gaps", group = GROUP_FAIR_VALUE_GAPS)
+RetestDistanceMode fvgSizeMode = input.enum(RetestDistanceMode.Atr, "FVG size mode", group = GROUP_FAIR_VALUE_GAPS)
+float minimumFvgSizeValue = input.float(0.10, "Minimum FVG size", minval = 0.0, group = GROUP_FAIR_VALUE_GAPS)
+float minimumFvgAtrRatio = input.float(0.10, "Minimum FVG ATR ratio", minval = 0.0, group = GROUP_FAIR_VALUE_GAPS)
+bool requireFvgDisplacementCandle = input.bool(true, "Require displacement candle", group = GROUP_FAIR_VALUE_GAPS)
+float minimumFvgDisplacementBodyPercent = input.float(55.0, "Minimum displacement body %", minval = 0.0, maxval = 100.0, group = GROUP_FAIR_VALUE_GAPS)
+int maximumActiveFvgs = input.int(5, "Maximum active FVGs", minval = 1, maxval = 20, group = GROUP_FAIR_VALUE_GAPS)
+int maximumFvgAge = input.int(100, "Maximum FVG age (bars)", minval = 1, group = GROUP_FAIR_VALUE_GAPS)
+FvgInvalidationMode fvgInvalidationMode = input.enum(FvgInvalidationMode.Midpoint, "FVG invalidation mode", group = GROUP_FAIR_VALUE_GAPS)
+bool orderBlocksEnabled = input.bool(true, "Enable Order Blocks", group = GROUP_ORDER_BLOCKS)
+int orderBlockLookback = input.int(10, "Order Block lookback", minval = 1, maxval = 50, group = GROUP_ORDER_BLOCKS)
+float minimumOrderBlockDisplacementAtr = input.float(0.75, "Minimum displacement ATR", minval = 0.0, group = GROUP_ORDER_BLOCKS)
+bool requireOrderBlockStructureBreak = input.bool(true, "Require structure break", group = GROUP_ORDER_BLOCKS)
+int maximumActiveOrderBlocks = input.int(5, "Maximum active Order Blocks", minval = 1, maxval = 20, group = GROUP_ORDER_BLOCKS)
+int maximumOrderBlockAge = input.int(100, "Maximum Order Block age (bars)", minval = 1, group = GROUP_ORDER_BLOCKS)
+OrderBlockInvalidationMode orderBlockInvalidationMode = input.enum(OrderBlockInvalidationMode.WickThrough, "Order Block invalidation mode", group = GROUP_ORDER_BLOCKS)
+bool premiumDiscountEnabled = input.bool(true, "Enable Premium/Discount context", group = GROUP_PREMIUM_DISCOUNT)
+DealingRangeMode dealingRangeMode = input.enum(DealingRangeMode.RecentStructure, "Dealing range mode", group = GROUP_PREMIUM_DISCOUNT)
+float smartMoneyBiasMinimumDifference = input.float(10.0, "Bias minimum difference", minval = 0.0, group = GROUP_SMART_MONEY_SCORE)
+bool showLiquiditySweeps = input.bool(true, "Show liquidity sweeps", group = GROUP_SMART_MONEY_SCORE)
+bool showFvgZones = input.bool(true, "Show FVG zones", group = GROUP_SMART_MONEY_SCORE)
+bool showOrderBlocks = input.bool(true, "Show Order Blocks", group = GROUP_SMART_MONEY_SCORE)
+bool showPremiumDiscount = input.bool(false, "Show Premium/Discount", group = GROUP_SMART_MONEY_SCORE)
+bool showSmartMoneyScore = input.bool(true, "Show Smart Money score", group = GROUP_SMART_MONEY_SCORE)
 
 //============================================================================== 
 // 4. STATE MODELS
@@ -303,6 +410,27 @@ type BreakoutEngineState
     int barIndex
     int failureBars
 
+type FvgZone
+    TradeDirection direction
+    float top
+    float bottom
+    float midpoint
+    int creationBar
+    bool active
+    bool partiallyMitigated
+    bool fullyMitigated
+
+type OrderBlockZone
+    TradeDirection direction
+    float top
+    float bottom
+    float midpoint
+    int creationBar
+    int sourceBar
+    bool active
+    bool mitigated
+    bool invalidated
+
 var SessionEngineState sessionState = SessionEngineState.new(SessionName.None, false, false, false, na, 0, 0, 0.0, 0)
 var OpeningRangeState rangeState = OpeningRangeState.new(na, na, na, na, na, na, na, na, na, 0, false, false, false)
 var TradeControlState tradeControl = TradeControlState.new(false, false, false, false)
@@ -344,6 +472,79 @@ var int bullishRetestFailureCount = 0
 var int bearishRetestFailureCount = 0
 var int retestAttemptCount = 0
 var bool retestRetryPending = false
+var float equalHighLevel = na
+var float equalLowLevel = na
+var bool equalHighActive = false
+var bool equalLowActive = false
+var int equalHighTouchCount = 0
+var int equalLowTouchCount = 0
+var int equalHighLastBar = na
+var int equalLowLastBar = na
+var float sweptLevel = na
+var float sweepDistance = na
+var float sweepDistanceATR = na
+var LiquiditySource sweepSource = LiquiditySource.None
+var SweepStrength sweepStrength = SweepStrength.Weak
+var TradeDirection sweepBias = TradeDirection.None
+var int sweepBarIndex = na
+var int bullishSweepConfirmationCount = 0
+var int bearishSweepConfirmationCount = 0
+var bool bullishLiquiditySweep = false
+var bool bearishLiquiditySweep = false
+var array<FvgZone> bullishFvgZones = array.new<FvgZone>()
+var array<FvgZone> bearishFvgZones = array.new<FvgZone>()
+var float latestBullishFvgTop = na
+var float latestBullishFvgBottom = na
+var float latestBullishFvgMid = na
+var int latestBullishFvgAge = na
+var bool latestBullishFvgActive = false
+var float latestBearishFvgTop = na
+var float latestBearishFvgBottom = na
+var float latestBearishFvgMid = na
+var int latestBearishFvgAge = na
+var bool latestBearishFvgActive = false
+var float nearestBullishFvgDistance = na
+var float nearestBearishFvgDistance = na
+var float nearestBullishFvgDistanceATR = na
+var float nearestBearishFvgDistanceATR = na
+var bool insideBullishFvg = false
+var bool insideBearishFvg = false
+var bool bullishFvgSupportsRetest = false
+var bool bearishFvgSupportsRetest = false
+var array<OrderBlockZone> bullishOrderBlocks = array.new<OrderBlockZone>()
+var array<OrderBlockZone> bearishOrderBlocks = array.new<OrderBlockZone>()
+var float latestBullishObTop = na
+var float latestBullishObBottom = na
+var float latestBullishObMid = na
+var int latestBullishObAge = na
+var bool latestBullishObActive = false
+var float latestBearishObTop = na
+var float latestBearishObBottom = na
+var float latestBearishObMid = na
+var int latestBearishObAge = na
+var bool latestBearishObActive = false
+var float nearestBullishObDistance = na
+var float nearestBearishObDistance = na
+var float nearestBullishObDistanceATR = na
+var float nearestBearishObDistanceATR = na
+var bool insideBullishOrderBlock = false
+var bool insideBearishOrderBlock = false
+var bool bullishObSupportsRetest = false
+var bool bearishObSupportsRetest = false
+var float dealingRangeHigh = na
+var float dealingRangeLow = na
+var float dealingRangeEquilibrium = na
+var PremiumDiscountState premiumDiscountState = PremiumDiscountState.Unknown
+var bool bullishDiscountSupportsRetest = false
+var bool bearishPremiumSupportsRetest = false
+var float bullishSmartMoneyScore = 0.0
+var float bearishSmartMoneyScore = 0.0
+var SmartMoneyBias smartMoneyBias = SmartMoneyBias.Neutral
+var SmartMoneyStrength smartMoneyStrength = SmartMoneyStrength.Weak
+var bool priceAbovePDH = false
+var bool priceBelowPDL = false
+var bool priceAbovePWH = false
+var bool priceBelowPWL = false
 
 //============================================================================== 
 // 5. UTILITY FUNCTIONS
@@ -392,6 +593,21 @@ RetestStateText(RetestState state) =>
 // Returns a display label for an M5 retest direction.
 RetestDirectionText(TradeDirection direction) =>
     direction == TradeDirection.Long ? "Bullish" : direction == TradeDirection.Short ? "Bearish" : "None"
+
+LiquiditySourceText(series LiquiditySource source) =>
+    source == LiquiditySource.EqualHigh ? "Equal High" : source == LiquiditySource.EqualLow ? "Equal Low" : source == LiquiditySource.PreviousDayHigh ? "PDH" : source == LiquiditySource.PreviousDayLow ? "PDL" : source == LiquiditySource.PreviousWeekHigh ? "PWH" : source == LiquiditySource.PreviousWeekLow ? "PWL" : source == LiquiditySource.SwingHigh ? "Swing High" : source == LiquiditySource.SwingLow ? "Swing Low" : source == LiquiditySource.OpeningRangeHigh ? "OR High" : source == LiquiditySource.OpeningRangeLow ? "OR Low" : "None"
+
+SweepStrengthText(series SweepStrength strength) =>
+    strength == SweepStrength.Extreme ? "Extreme" : strength == SweepStrength.Strong ? "Strong" : strength == SweepStrength.Normal ? "Normal" : "Weak"
+
+PremiumDiscountText(series PremiumDiscountState state) =>
+    state == PremiumDiscountState.Premium ? "Premium" : state == PremiumDiscountState.Discount ? "Discount" : state == PremiumDiscountState.Equilibrium ? "Equilibrium" : "Unknown"
+
+SmartMoneyBiasText(series SmartMoneyBias bias) =>
+    bias == SmartMoneyBias.Bullish ? "Bullish" : bias == SmartMoneyBias.Bearish ? "Bearish" : "Neutral"
+
+SmartMoneyStrengthText(series SmartMoneyStrength strength) =>
+    strength == SmartMoneyStrength.Extreme ? "Extreme" : strength == SmartMoneyStrength.Strong ? "Strong" : strength == SmartMoneyStrength.Normal ? "Normal" : "Weak"
 
 // Formats a nullable decimal value for the dashboard without displaying na.
 FormatValueOrDash(float value) =>
@@ -506,6 +722,72 @@ CalculateMarketStructure(float previousHigh, float previousLow, float currentHig
     bool breaksHigh = not na(nextPreviousHigh) and ta.crossover(close, nextPreviousHigh)
     bool breaksLow = not na(nextPreviousLow) and ta.crossunder(close, nextPreviousLow)
     [nextPreviousHigh, nextPreviousLow, nextCurrentHigh, nextCurrentLow, nextStructure, breaksHigh or breaksLow]
+
+// Calculates one bounded, pivot-confirmed equal-level cluster without mutating global state.
+// Pivot values are delayed by the M3 right-side confirmation length and do not repaint once received.
+CalculateEqualLevelState(bool enabled, bool isHighLevel, float previousLevel, int previousTouches, int previousLastBar, float confirmedPivot, int pivotBarIndex, float tolerance, bool toleranceValid, int minimumTouches, int maximumAge, float currentHigh, float currentLow) =>
+    float nextLevel = previousLevel
+    int nextTouches = previousTouches
+    int nextLastBar = previousLastBar
+    bool hasLevel = not na(nextLevel)
+    bool expired = hasLevel and not na(nextLastBar) and bar_index - nextLastBar > maximumAge
+    bool invalidated = hasLevel and toleranceValid and (isHighLevel ? currentHigh > nextLevel + tolerance : currentLow < nextLevel - tolerance)
+    if not enabled or expired or invalidated
+        nextLevel := na
+        nextTouches := 0
+        nextLastBar := na
+    if enabled and not na(confirmedPivot)
+        if na(nextLevel)
+            nextLevel := confirmedPivot
+            nextTouches := 1
+            nextLastBar := pivotBarIndex
+        else if toleranceValid and math.abs(confirmedPivot - nextLevel) <= tolerance
+            nextLevel := (nextLevel * nextTouches + confirmedPivot) / (nextTouches + 1)
+            nextTouches += 1
+            nextLastBar := pivotBarIndex
+        else
+            nextLevel := confirmedPivot
+            nextTouches := 1
+            nextLastBar := pivotBarIndex
+    bool active = enabled and toleranceValid and not na(nextLevel) and nextTouches >= minimumTouches and not na(nextLastBar) and bar_index - nextLastBar <= maximumAge
+    [nextLevel, nextTouches, nextLastBar, active]
+
+// Converts one sweep penetration input to price units without introducing a new ATR calculation.
+CalculateSweepPenetration(float level, float inputValue, RetestDistanceMode mode, float atrValue) =>
+    na(level) ? na : mode == RetestDistanceMode.Ticks ? inputValue * syminfo.mintick : mode == RetestDistanceMode.Atr ? atrValue * inputValue : math.abs(level) * inputValue * 0.01
+
+// Returns true when a completed candle sweeps sell-side liquidity and rejects upward.
+IsBullishSweepAtLevel(float level, float minimumInput, float maximumInput, RetestDistanceMode mode, float atrValue, bool requireCloseBack, bool requireRejectionWick, float minimumWickPercent, float lowPrice, float closePrice, float wickPercent) =>
+    float minimumPenetration = CalculateSweepPenetration(level, minimumInput, mode, atrValue)
+    float maximumPenetration = CalculateSweepPenetration(level, maximumInput, mode, atrValue)
+    float penetration = not na(level) ? level - lowPrice : na
+    bool boundsValid = not na(minimumPenetration) and not na(maximumPenetration) and minimumPenetration <= maximumPenetration
+    bool penetrationValid = not na(penetration) and penetration > 0.0 and penetration >= minimumPenetration and penetration <= maximumPenetration
+    bool closeBackValid = not requireCloseBack or (not na(level) and closePrice > level)
+    bool rejectionWickValid = not requireRejectionWick or wickPercent >= minimumWickPercent
+    not na(level) and boundsValid and penetrationValid and closeBackValid and rejectionWickValid
+
+// Returns true when a completed candle sweeps buy-side liquidity and rejects downward.
+IsBearishSweepAtLevel(float level, float minimumInput, float maximumInput, RetestDistanceMode mode, float atrValue, bool requireCloseBack, bool requireRejectionWick, float minimumWickPercent, float highPrice, float closePrice, float wickPercent) =>
+    float minimumPenetration = CalculateSweepPenetration(level, minimumInput, mode, atrValue)
+    float maximumPenetration = CalculateSweepPenetration(level, maximumInput, mode, atrValue)
+    float penetration = not na(level) ? highPrice - level : na
+    bool boundsValid = not na(minimumPenetration) and not na(maximumPenetration) and minimumPenetration <= maximumPenetration
+    bool penetrationValid = not na(penetration) and penetration > 0.0 and penetration >= minimumPenetration and penetration <= maximumPenetration
+    bool closeBackValid = not requireCloseBack or (not na(level) and closePrice < level)
+    bool rejectionWickValid = not requireRejectionWick or wickPercent >= minimumWickPercent
+    not na(level) and boundsValid and penetrationValid and closeBackValid and rejectionWickValid
+
+// Classifies accepted sweep context from bounded penetration, wick quality, close-back, and source significance.
+CalculateSweepStrength(float penetration, float maximumPenetration, float wickPercent, bool closeBack, LiquiditySource source) =>
+    float penetrationRatio = not na(penetration) and maximumPenetration > 0.0 ? math.min(math.max(penetration / maximumPenetration, 0.0), 1.0) : 0.0
+    float sourceScore = source == LiquiditySource.EqualHigh or source == LiquiditySource.EqualLow ? 30.0 : source == LiquiditySource.PreviousDayHigh or source == LiquiditySource.PreviousDayLow ? 25.0 : source == LiquiditySource.PreviousWeekHigh or source == LiquiditySource.PreviousWeekLow ? 25.0 : source == LiquiditySource.SwingHigh or source == LiquiditySource.SwingLow ? 15.0 : source == LiquiditySource.OpeningRangeHigh or source == LiquiditySource.OpeningRangeLow ? 10.0 : 0.0
+    float score = sourceScore + penetrationRatio * 25.0 + math.min(math.max(wickPercent, 0.0), 100.0) * 0.25 + (closeBack ? 20.0 : 0.0)
+    score >= 85.0 ? SweepStrength.Extreme : score >= 65.0 ? SweepStrength.Strong : score >= 40.0 ? SweepStrength.Normal : SweepStrength.Weak
+
+// Returns the non-negative distance from a price to an FVG zone, or na for invalid bounds.
+DistanceToFvgZone(float price, float top, float bottom) =>
+    na(price) or na(top) or na(bottom) or top < bottom ? na : price > top ? price - top : price < bottom ? bottom - price : 0.0
 
 // Calculates the normalized trend values without mutating persistent global state.
 CalculateTrendState(float fastEma, float slowEma, float htfFastEma, float htfSlowEma, float vwapValue, float priorVwapValue, float adxValue, float plusDiValue, float minusDiValue, MarketStructure structure) =>
@@ -711,7 +993,7 @@ CalculateTrendLabel(label previousLabel) =>
 //============================================================================== 
 // 11. DASHBOARD AND DEBUG
 //============================================================================== 
-var table dashboard = table.new(position.top_right, 2, 34, border_width = 1)
+var table dashboard = table.new(position.top_right, 2, 50, border_width = 1)
 var table debugTable = table.new(position.bottom_right, 2, 6, border_width = 1)
 
 // Writes one consistently styled dashboard row.
@@ -757,8 +1039,24 @@ UpdateDashboard() =>
             SetDashboardRow(dashboard, 31, "Retest penetration ATR", FormatValueOrDash(retestPenetrationATR))
             SetDashboardRow(dashboard, 32, "Retest confirmed", retestConfirmed ? "Yes" : "No")
             SetDashboardRow(dashboard, 33, "Retest failed", retestFailed ? "Yes" : "No")
+            SetDashboardRow(dashboard, 34, "Smart Money bias", SmartMoneyBiasText(smartMoneyBias))
+            SetDashboardRow(dashboard, 35, "SMC strength", SmartMoneyStrengthText(smartMoneyStrength))
+            SetDashboardRow(dashboard, 36, "Bullish SMC score", showSmartMoneyScore ? FormatValueOrDash(bullishSmartMoneyScore) : "-")
+            SetDashboardRow(dashboard, 37, "Bearish SMC score", showSmartMoneyScore ? FormatValueOrDash(bearishSmartMoneyScore) : "-")
+            SetDashboardRow(dashboard, 38, "Liquidity sweep", bullishLiquiditySweep ? "Bullish" : bearishLiquiditySweep ? "Bearish" : "-")
+            SetDashboardRow(dashboard, 39, "Sweep source", LiquiditySourceText(sweepSource))
+            SetDashboardRow(dashboard, 40, "Sweep strength", SweepStrengthText(sweepStrength))
+            SetDashboardRow(dashboard, 41, "Bullish FVG", latestBullishFvgActive ? "Active" : "-")
+            SetDashboardRow(dashboard, 42, "Bearish FVG", latestBearishFvgActive ? "Active" : "-")
+            SetDashboardRow(dashboard, 43, "Bullish OB", latestBullishObActive ? "Active" : "-")
+            SetDashboardRow(dashboard, 44, "Bearish OB", latestBearishObActive ? "Active" : "-")
+            SetDashboardRow(dashboard, 45, "Premium / Discount", PremiumDiscountText(premiumDiscountState))
+            SetDashboardRow(dashboard, 46, "Equal high", equalHighActive ? "Active" : "-")
+            SetDashboardRow(dashboard, 47, "Equal low", equalLowActive ? "Active" : "-")
+            SetDashboardRow(dashboard, 48, "PDH / PDL", priceAbovePDH ? "Above PDH" : priceBelowPDL ? "Below PDL" : "Between")
+            SetDashboardRow(dashboard, 49, "PWH / PWL", priceAbovePWH ? "Above PWH" : priceBelowPWL ? "Below PWL" : "Between")
         else
-            table.clear(dashboard, 0, 0, 1, 33)
+            table.clear(dashboard, 0, 0, 1, 49)
 
 // Updates the diagnostic panel only on the last chart bar when debugging is enabled.
 UpdateDebugPanel() =>
@@ -892,15 +1190,78 @@ float vwapValue = ta.vwap(hlc3)
 [plusDiValue, minusDiValue, adxValue] = ta.dmi(adxLength, adxLength)
 float confirmedPivotHigh = ta.pivothigh(high, pivotLength, pivotLength)
 float confirmedPivotLow = ta.pivotlow(low, pivotLength, pivotLength)
+[previousDayHigh, previousDayLow, previousDayClose] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1]], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[previousWeekHigh, previousWeekLow, previousWeekClose] = request.security(syminfo.tickerid, "W", [high[1], low[1], close[1]], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+float previousDayMid = not na(previousDayHigh) and not na(previousDayLow) ? (previousDayHigh + previousDayLow) * 0.5 : na
+float previousWeekMid = not na(previousWeekHigh) and not na(previousWeekLow) ? (previousWeekHigh + previousWeekLow) * 0.5 : na
+priceAbovePDH := not na(previousDayHigh) and close > previousDayHigh
+priceBelowPDL := not na(previousDayLow) and close < previousDayLow
+priceAbovePWH := not na(previousWeekHigh) and close > previousWeekHigh
+priceBelowPWL := not na(previousWeekLow) and close < previousWeekLow
+float distanceToPDH = not na(previousDayHigh) ? math.abs(close - previousDayHigh) : na
+float distanceToPDL = not na(previousDayLow) ? math.abs(close - previousDayLow) : na
+float distanceToPWH = not na(previousWeekHigh) ? math.abs(close - previousWeekHigh) : na
+float distanceToPWL = not na(previousWeekLow) ? math.abs(close - previousWeekLow) : na
+float equalLevelTolerance = equalLevelToleranceMode == EqualLevelToleranceMode.Ticks ? equalLevelToleranceValue * syminfo.mintick : equalLevelToleranceMode == EqualLevelToleranceMode.Atr ? atrValue * equalLevelToleranceValue : close * equalLevelToleranceValue * 0.01
+bool equalLevelToleranceValid = not na(equalLevelTolerance)
+bool bullishEqualLowSweepRaw = liquiditySweepsEnabled and equalLowActive and IsBullishSweepAtLevel(equalLowLevel, minimumSweepPenetrationValue, maximumSweepPenetrationValue, sweepPenetrationMode, atrValue, requireSweepCloseBack, requireSweepRejectionWick, minimumSweepRejectionWickPercent, low, close, lowerWickPercent)
+bool bullishPreviousDayLowSweepRaw = liquiditySweepsEnabled and IsBullishSweepAtLevel(previousDayLow, minimumSweepPenetrationValue, maximumSweepPenetrationValue, sweepPenetrationMode, atrValue, requireSweepCloseBack, requireSweepRejectionWick, minimumSweepRejectionWickPercent, low, close, lowerWickPercent)
+bool bullishPreviousWeekLowSweepRaw = liquiditySweepsEnabled and IsBullishSweepAtLevel(previousWeekLow, minimumSweepPenetrationValue, maximumSweepPenetrationValue, sweepPenetrationMode, atrValue, requireSweepCloseBack, requireSweepRejectionWick, minimumSweepRejectionWickPercent, low, close, lowerWickPercent)
+bool bullishSwingLowSweepRaw = liquiditySweepsEnabled and IsBullishSweepAtLevel(trendState.swingLow, minimumSweepPenetrationValue, maximumSweepPenetrationValue, sweepPenetrationMode, atrValue, requireSweepCloseBack, requireSweepRejectionWick, minimumSweepRejectionWickPercent, low, close, lowerWickPercent)
+bool bullishOpeningRangeLowSweepRaw = liquiditySweepsEnabled and rangeState.isComplete and rangeState.qualityAccepted and IsBullishSweepAtLevel(rangeState.low, minimumSweepPenetrationValue, maximumSweepPenetrationValue, sweepPenetrationMode, atrValue, requireSweepCloseBack, requireSweepRejectionWick, minimumSweepRejectionWickPercent, low, close, lowerWickPercent)
+bool bearishEqualHighSweepRaw = liquiditySweepsEnabled and equalHighActive and IsBearishSweepAtLevel(equalHighLevel, minimumSweepPenetrationValue, maximumSweepPenetrationValue, sweepPenetrationMode, atrValue, requireSweepCloseBack, requireSweepRejectionWick, minimumSweepRejectionWickPercent, high, close, upperWickPercent)
+bool bearishPreviousDayHighSweepRaw = liquiditySweepsEnabled and IsBearishSweepAtLevel(previousDayHigh, minimumSweepPenetrationValue, maximumSweepPenetrationValue, sweepPenetrationMode, atrValue, requireSweepCloseBack, requireSweepRejectionWick, minimumSweepRejectionWickPercent, high, close, upperWickPercent)
+bool bearishPreviousWeekHighSweepRaw = liquiditySweepsEnabled and IsBearishSweepAtLevel(previousWeekHigh, minimumSweepPenetrationValue, maximumSweepPenetrationValue, sweepPenetrationMode, atrValue, requireSweepCloseBack, requireSweepRejectionWick, minimumSweepRejectionWickPercent, high, close, upperWickPercent)
+bool bearishSwingHighSweepRaw = liquiditySweepsEnabled and IsBearishSweepAtLevel(trendState.swingHigh, minimumSweepPenetrationValue, maximumSweepPenetrationValue, sweepPenetrationMode, atrValue, requireSweepCloseBack, requireSweepRejectionWick, minimumSweepRejectionWickPercent, high, close, upperWickPercent)
+bool bearishOpeningRangeHighSweepRaw = liquiditySweepsEnabled and rangeState.isComplete and rangeState.qualityAccepted and IsBearishSweepAtLevel(rangeState.high, minimumSweepPenetrationValue, maximumSweepPenetrationValue, sweepPenetrationMode, atrValue, requireSweepCloseBack, requireSweepRejectionWick, minimumSweepRejectionWickPercent, high, close, upperWickPercent)
+bool bullishRawLiquiditySweep = barstate.isconfirmed and (bullishEqualLowSweepRaw or bullishPreviousDayLowSweepRaw or bullishPreviousWeekLowSweepRaw or bullishSwingLowSweepRaw or bullishOpeningRangeLowSweepRaw)
+bool bearishRawLiquiditySweep = barstate.isconfirmed and (bearishEqualHighSweepRaw or bearishPreviousDayHighSweepRaw or bearishPreviousWeekHighSweepRaw or bearishSwingHighSweepRaw or bearishOpeningRangeHighSweepRaw)
+LiquiditySource bullishSweepSourceCandidate = bullishEqualLowSweepRaw ? LiquiditySource.EqualLow : bullishPreviousDayLowSweepRaw ? LiquiditySource.PreviousDayLow : bullishPreviousWeekLowSweepRaw ? LiquiditySource.PreviousWeekLow : bullishSwingLowSweepRaw ? LiquiditySource.SwingLow : bullishOpeningRangeLowSweepRaw ? LiquiditySource.OpeningRangeLow : LiquiditySource.None
+LiquiditySource bearishSweepSourceCandidate = bearishEqualHighSweepRaw ? LiquiditySource.EqualHigh : bearishPreviousDayHighSweepRaw ? LiquiditySource.PreviousDayHigh : bearishPreviousWeekHighSweepRaw ? LiquiditySource.PreviousWeekHigh : bearishSwingHighSweepRaw ? LiquiditySource.SwingHigh : bearishOpeningRangeHighSweepRaw ? LiquiditySource.OpeningRangeHigh : LiquiditySource.None
+float bullishSweepLevelCandidate = bullishEqualLowSweepRaw ? equalLowLevel : bullishPreviousDayLowSweepRaw ? previousDayLow : bullishPreviousWeekLowSweepRaw ? previousWeekLow : bullishSwingLowSweepRaw ? trendState.swingLow : bullishOpeningRangeLowSweepRaw ? rangeState.low : na
+float bearishSweepLevelCandidate = bearishEqualHighSweepRaw ? equalHighLevel : bearishPreviousDayHighSweepRaw ? previousDayHigh : bearishPreviousWeekHighSweepRaw ? previousWeekHigh : bearishSwingHighSweepRaw ? trendState.swingHigh : bearishOpeningRangeHighSweepRaw ? rangeState.high : na
+float bullishSweepPenetrationCandidate = not na(bullishSweepLevelCandidate) ? bullishSweepLevelCandidate - low : na
+float bearishSweepPenetrationCandidate = not na(bearishSweepLevelCandidate) ? high - bearishSweepLevelCandidate : na
+float bullishSweepMaximumPenetration = CalculateSweepPenetration(bullishSweepLevelCandidate, maximumSweepPenetrationValue, sweepPenetrationMode, atrValue)
+float bearishSweepMaximumPenetration = CalculateSweepPenetration(bearishSweepLevelCandidate, maximumSweepPenetrationValue, sweepPenetrationMode, atrValue)
+bool bullishFvgCreated = false
+bool bearishFvgCreated = false
+bool fvgHistoryAvailable = bar_index >= 2
+float bullishFvgBottomCandidate = fvgHistoryAvailable ? high[2] : na
+float bullishFvgTopCandidate = fvgHistoryAvailable ? low : na
+float bearishFvgBottomCandidate = fvgHistoryAvailable ? high : na
+float bearishFvgTopCandidate = fvgHistoryAvailable ? low[2] : na
+float bullishFvgMidCandidate = not na(bullishFvgTopCandidate) and not na(bullishFvgBottomCandidate) ? (bullishFvgTopCandidate + bullishFvgBottomCandidate) * 0.5 : na
+float bearishFvgMidCandidate = not na(bearishFvgTopCandidate) and not na(bearishFvgBottomCandidate) ? (bearishFvgTopCandidate + bearishFvgBottomCandidate) * 0.5 : na
+float bullishFvgSizeCandidate = not na(bullishFvgTopCandidate) and not na(bullishFvgBottomCandidate) ? bullishFvgTopCandidate - bullishFvgBottomCandidate : na
+float bearishFvgSizeCandidate = not na(bearishFvgTopCandidate) and not na(bearishFvgBottomCandidate) ? bearishFvgTopCandidate - bearishFvgBottomCandidate : na
+float bullishFvgMinimumSize = CalculateSweepPenetration(bullishFvgMidCandidate, minimumFvgSizeValue, fvgSizeMode, atrValue)
+float bearishFvgMinimumSize = CalculateSweepPenetration(bearishFvgMidCandidate, minimumFvgSizeValue, fvgSizeMode, atrValue)
+float bullishFvgSizeATR = SafeDivide(bullishFvgSizeCandidate, atrValue, na)
+float bearishFvgSizeATR = SafeDivide(bearishFvgSizeCandidate, atrValue, na)
+bool bullishFvgDisplacementValid = not requireFvgDisplacementCandle or (close[1] > open[1] and bodyPercent[1] >= minimumFvgDisplacementBodyPercent)
+bool bearishFvgDisplacementValid = not requireFvgDisplacementCandle or (close[1] < open[1] and bodyPercent[1] >= minimumFvgDisplacementBodyPercent)
+bool bullishFvgCandidate = fairValueGapsEnabled and barstate.isconfirmed and fvgHistoryAvailable and not na(bullishFvgSizeCandidate) and bullishFvgSizeCandidate > 0.0 and not na(bullishFvgMinimumSize) and bullishFvgSizeCandidate >= bullishFvgMinimumSize and not na(bullishFvgSizeATR) and bullishFvgSizeATR >= minimumFvgAtrRatio and bullishFvgDisplacementValid
+bool bearishFvgCandidate = fairValueGapsEnabled and barstate.isconfirmed and fvgHistoryAvailable and not na(bearishFvgSizeCandidate) and bearishFvgSizeCandidate > 0.0 and not na(bearishFvgMinimumSize) and bearishFvgSizeCandidate >= bearishFvgMinimumSize and not na(bearishFvgSizeATR) and bearishFvgSizeATR >= minimumFvgAtrRatio and bearishFvgDisplacementValid
 bool symbolMatches = str.contains(str.upper(syminfo.tickerid), str.upper(expectedSymbol))
 
 if barstate.isconfirmed
     [nextPriorSwingHigh, nextPriorSwingLow, nextCurrentSwingHigh, nextCurrentSwingLow, nextStructure, nextStructureBreak] = CalculateMarketStructure(priorSwingHigh, priorSwingLow, trendState.swingHigh, trendState.swingLow, trendState.structure, confirmedPivotHigh, confirmedPivotLow)
+    [nextEqualHighLevel, nextEqualHighTouches, nextEqualHighLastBar, nextEqualHighActive] = CalculateEqualLevelState(equalLevelsEnabled, true, equalHighLevel, equalHighTouchCount, equalHighLastBar, confirmedPivotHigh, bar_index - pivotLength, equalLevelTolerance, equalLevelToleranceValid, equalLevelMinimumTouches, equalLevelMaximumAge, high, low)
+    [nextEqualLowLevel, nextEqualLowTouches, nextEqualLowLastBar, nextEqualLowActive] = CalculateEqualLevelState(equalLevelsEnabled, false, equalLowLevel, equalLowTouchCount, equalLowLastBar, confirmedPivotLow, bar_index - pivotLength, equalLevelTolerance, equalLevelToleranceValid, equalLevelMinimumTouches, equalLevelMaximumAge, high, low)
     [nextTrendDirection, nextTrendStrength, nextTrendScore, nextVwapDistance, nextVwapSlope, nextIsTrending] = CalculateTrendState(fastEmaValue, slowEmaValue, htfFastEmaValue, htfSlowEmaValue, vwapValue, vwapValue[1], adxValue, plusDiValue, minusDiValue, nextStructure)
 
     // Persistent Trend Engine state is assigned only from the main execution scope.
     priorSwingHigh := nextPriorSwingHigh
     priorSwingLow := nextPriorSwingLow
+    equalHighLevel := nextEqualHighLevel
+    equalHighTouchCount := nextEqualHighTouches
+    equalHighLastBar := nextEqualHighLastBar
+    equalHighActive := nextEqualHighActive
+    equalLowLevel := nextEqualLowLevel
+    equalLowTouchCount := nextEqualLowTouches
+    equalLowLastBar := nextEqualLowLastBar
+    equalLowActive := nextEqualLowActive
     trendState.swingHigh := nextCurrentSwingHigh
     trendState.swingLow := nextCurrentSwingLow
     trendState.structure := nextStructure
@@ -1145,10 +1506,293 @@ if barstate.isconfirmed
             retestScore := bearishRetestScore
             retestBarIndex := bar_index
             bearishRetestConfirmed := true
+    // M6-B priority is Equal, Previous Day, Previous Week, M3 Swing, then Opening Range.
+    // An ambiguous two-sided sweep is rejected so only one directional event can occur per bar.
+    bullishLiquiditySweep := false
+    bearishLiquiditySweep := false
+    if bullishRawLiquiditySweep != bearishRawLiquiditySweep
+        if bullishRawLiquiditySweep
+            bullishSweepConfirmationCount += 1
+            bearishSweepConfirmationCount := 0
+            if bullishSweepConfirmationCount == sweepConfirmationBars
+                bullishLiquiditySweep := true
+                sweptLevel := bullishSweepLevelCandidate
+                sweepDistance := bullishSweepPenetrationCandidate
+                sweepDistanceATR := SafeDivide(sweepDistance, atrValue, na)
+                sweepSource := bullishSweepSourceCandidate
+                sweepStrength := CalculateSweepStrength(sweepDistance, bullishSweepMaximumPenetration, lowerWickPercent, close > sweptLevel, sweepSource)
+                sweepBias := TradeDirection.Long
+                sweepBarIndex := bar_index
+        else
+            bearishSweepConfirmationCount += 1
+            bullishSweepConfirmationCount := 0
+            if bearishSweepConfirmationCount == sweepConfirmationBars
+                bearishLiquiditySweep := true
+                sweptLevel := bearishSweepLevelCandidate
+                sweepDistance := bearishSweepPenetrationCandidate
+                sweepDistanceATR := SafeDivide(sweepDistance, atrValue, na)
+                sweepSource := bearishSweepSourceCandidate
+                sweepStrength := CalculateSweepStrength(sweepDistance, bearishSweepMaximumPenetration, upperWickPercent, close < sweptLevel, sweepSource)
+                sweepBias := TradeDirection.Short
+                sweepBarIndex := bar_index
+    else
+        bullishSweepConfirmationCount := 0
+        bearishSweepConfirmationCount := 0
+    // M6-C keeps both direction-specific arrays bounded and applies wick-based
+    // mitigation for Midpoint/FullFill; CloseThrough requires a completed close.
+    bullishFvgCreated := false
+    bearishFvgCreated := false
+    if not fairValueGapsEnabled
+        array.clear(bullishFvgZones)
+        array.clear(bearishFvgZones)
+    while array.size(bullishFvgZones) > maximumActiveFvgs
+        array.shift(bullishFvgZones)
+    while array.size(bearishFvgZones) > maximumActiveFvgs
+        array.shift(bearishFvgZones)
+    if array.size(bullishFvgZones) > 0
+        for index = 0 to array.size(bullishFvgZones) - 1
+            FvgZone zone = array.get(bullishFvgZones, index)
+            if zone.active
+                bool expired = bar_index - zone.creationBar > maximumFvgAge
+                bool enteredFromAbove = close[1] > zone.top and low <= zone.top and high >= zone.bottom
+                bool fullyMitigated = fvgInvalidationMode == FvgInvalidationMode.Midpoint ? low <= zone.midpoint : fvgInvalidationMode == FvgInvalidationMode.FullFill ? low <= zone.bottom : close <= zone.bottom
+                zone.partiallyMitigated := zone.partiallyMitigated or (enteredFromAbove and not fullyMitigated)
+                zone.fullyMitigated := zone.fullyMitigated or fullyMitigated
+                zone.active := not expired and not zone.fullyMitigated
+                array.set(bullishFvgZones, index, zone)
+    if array.size(bearishFvgZones) > 0
+        for index = 0 to array.size(bearishFvgZones) - 1
+            FvgZone zone = array.get(bearishFvgZones, index)
+            if zone.active
+                bool expired = bar_index - zone.creationBar > maximumFvgAge
+                bool enteredFromBelow = close[1] < zone.bottom and high >= zone.bottom and low <= zone.top
+                bool fullyMitigated = fvgInvalidationMode == FvgInvalidationMode.Midpoint ? high >= zone.midpoint : fvgInvalidationMode == FvgInvalidationMode.FullFill ? high >= zone.top : close >= zone.top
+                zone.partiallyMitigated := zone.partiallyMitigated or (enteredFromBelow and not fullyMitigated)
+                zone.fullyMitigated := zone.fullyMitigated or fullyMitigated
+                zone.active := not expired and not zone.fullyMitigated
+                array.set(bearishFvgZones, index, zone)
+    if bullishFvgCandidate != bearishFvgCandidate
+        if bullishFvgCandidate
+            while array.size(bullishFvgZones) >= maximumActiveFvgs
+                array.shift(bullishFvgZones)
+            array.push(bullishFvgZones, FvgZone.new(TradeDirection.Long, bullishFvgTopCandidate, bullishFvgBottomCandidate, bullishFvgMidCandidate, bar_index, true, false, false))
+            bullishFvgCreated := true
+        else if bearishFvgCandidate
+            while array.size(bearishFvgZones) >= maximumActiveFvgs
+                array.shift(bearishFvgZones)
+            array.push(bearishFvgZones, FvgZone.new(TradeDirection.Short, bearishFvgTopCandidate, bearishFvgBottomCandidate, bearishFvgMidCandidate, bar_index, true, false, false))
+            bearishFvgCreated := true
+    latestBullishFvgTop := na
+    latestBullishFvgBottom := na
+    latestBullishFvgMid := na
+    latestBullishFvgAge := na
+    latestBullishFvgActive := false
+    nearestBullishFvgDistance := na
+    insideBullishFvg := false
+    bullishFvgSupportsRetest := false
+    int latestBullishFvgCreationBar = na
+    if array.size(bullishFvgZones) > 0
+        for index = 0 to array.size(bullishFvgZones) - 1
+            FvgZone zone = array.get(bullishFvgZones, index)
+            if zone.active
+                float zoneDistance = DistanceToFvgZone(close, zone.top, zone.bottom)
+                float retestZoneDistance = DistanceToFvgZone(retestLevel, zone.top, zone.bottom)
+                if na(latestBullishFvgCreationBar) or zone.creationBar > latestBullishFvgCreationBar
+                    latestBullishFvgTop := zone.top
+                    latestBullishFvgBottom := zone.bottom
+                    latestBullishFvgMid := zone.midpoint
+                    latestBullishFvgAge := bar_index - zone.creationBar
+                    latestBullishFvgActive := true
+                    latestBullishFvgCreationBar := zone.creationBar
+                if na(nearestBullishFvgDistance) or zoneDistance < nearestBullishFvgDistance
+                    nearestBullishFvgDistance := zoneDistance
+                insideBullishFvg := insideBullishFvg or zoneDistance == 0.0
+                bullishFvgSupportsRetest := bullishFvgSupportsRetest or (retestTradeDirection == TradeDirection.Long and (retestState == RetestState.WaitingForRetest or retestState == RetestState.RetestDetected) and not na(retestTolerance) and not na(retestZoneDistance) and retestZoneDistance <= retestTolerance)
+    latestBearishFvgTop := na
+    latestBearishFvgBottom := na
+    latestBearishFvgMid := na
+    latestBearishFvgAge := na
+    latestBearishFvgActive := false
+    nearestBearishFvgDistance := na
+    insideBearishFvg := false
+    bearishFvgSupportsRetest := false
+    int latestBearishFvgCreationBar = na
+    if array.size(bearishFvgZones) > 0
+        for index = 0 to array.size(bearishFvgZones) - 1
+            FvgZone zone = array.get(bearishFvgZones, index)
+            if zone.active
+                float zoneDistance = DistanceToFvgZone(close, zone.top, zone.bottom)
+                float retestZoneDistance = DistanceToFvgZone(retestLevel, zone.top, zone.bottom)
+                if na(latestBearishFvgCreationBar) or zone.creationBar > latestBearishFvgCreationBar
+                    latestBearishFvgTop := zone.top
+                    latestBearishFvgBottom := zone.bottom
+                    latestBearishFvgMid := zone.midpoint
+                    latestBearishFvgAge := bar_index - zone.creationBar
+                    latestBearishFvgActive := true
+                    latestBearishFvgCreationBar := zone.creationBar
+                if na(nearestBearishFvgDistance) or zoneDistance < nearestBearishFvgDistance
+                    nearestBearishFvgDistance := zoneDistance
+                insideBearishFvg := insideBearishFvg or zoneDistance == 0.0
+                bearishFvgSupportsRetest := bearishFvgSupportsRetest or (retestTradeDirection == TradeDirection.Short and (retestState == RetestState.WaitingForRetest or retestState == RetestState.RetestDetected) and not na(retestTolerance) and not na(retestZoneDistance) and retestZoneDistance <= retestTolerance)
+    nearestBullishFvgDistanceATR := SafeDivide(nearestBullishFvgDistance, atrValue, na)
+    nearestBearishFvgDistanceATR := SafeDivide(nearestBearishFvgDistance, atrValue, na)
+    // M6-D uses the complete opposite candle range as the deterministic OB zone.
+    float bullishObSourceTop = na
+    float bullishObSourceBottom = na
+    int bullishObSourceBar = na
+    float bearishObSourceTop = na
+    float bearishObSourceBottom = na
+    int bearishObSourceBar = na
+    bool bullishStructureContext = trendState.structureBreak and (trendState.structure == MarketStructure.HigherHigh or trendState.structure == MarketStructure.HigherLow)
+    bool bearishStructureContext = trendState.structureBreak and (trendState.structure == MarketStructure.LowerHigh or trendState.structure == MarketStructure.LowerLow)
+    bool bullishObSetup = orderBlocksEnabled and close > open and breakoutCandleATR >= minimumOrderBlockDisplacementAtr and (not requireOrderBlockStructureBreak or bullishStructureContext)
+    bool bearishObSetup = orderBlocksEnabled and close < open and breakoutCandleATR >= minimumOrderBlockDisplacementAtr and (not requireOrderBlockStructureBreak or bearishStructureContext)
+    if bullishObSetup
+        for offset = 1 to orderBlockLookback
+            if offset <= bar_index and na(bullishObSourceBar) and close[offset] < open[offset]
+                bullishObSourceTop := high[offset]
+                bullishObSourceBottom := low[offset]
+                bullishObSourceBar := bar_index - offset
+    if bearishObSetup
+        for offset = 1 to orderBlockLookback
+            if offset <= bar_index and na(bearishObSourceBar) and close[offset] > open[offset]
+                bearishObSourceTop := high[offset]
+                bearishObSourceBottom := low[offset]
+                bearishObSourceBar := bar_index - offset
+    if not orderBlocksEnabled
+        array.clear(bullishOrderBlocks)
+        array.clear(bearishOrderBlocks)
+    while array.size(bullishOrderBlocks) > maximumActiveOrderBlocks
+        array.shift(bullishOrderBlocks)
+    while array.size(bearishOrderBlocks) > maximumActiveOrderBlocks
+        array.shift(bearishOrderBlocks)
+    if array.size(bullishOrderBlocks) > 0
+        for index = 0 to array.size(bullishOrderBlocks) - 1
+            OrderBlockZone zone = array.get(bullishOrderBlocks, index)
+            if zone.active
+                bool invalidated = orderBlockInvalidationMode == OrderBlockInvalidationMode.WickThrough ? low < zone.bottom : close < zone.bottom
+                zone.mitigated := zone.mitigated or (close[1] > zone.top and low <= zone.top and high >= zone.bottom)
+                zone.invalidated := zone.invalidated or invalidated
+                zone.active := not zone.invalidated and bar_index - zone.creationBar <= maximumOrderBlockAge
+                array.set(bullishOrderBlocks, index, zone)
+    if array.size(bearishOrderBlocks) > 0
+        for index = 0 to array.size(bearishOrderBlocks) - 1
+            OrderBlockZone zone = array.get(bearishOrderBlocks, index)
+            if zone.active
+                bool invalidated = orderBlockInvalidationMode == OrderBlockInvalidationMode.WickThrough ? high > zone.top : close > zone.top
+                zone.mitigated := zone.mitigated or (close[1] < zone.bottom and high >= zone.bottom and low <= zone.top)
+                zone.invalidated := zone.invalidated or invalidated
+                zone.active := not zone.invalidated and bar_index - zone.creationBar <= maximumOrderBlockAge
+                array.set(bearishOrderBlocks, index, zone)
+    bool bullishObDuplicate = false
+    bool bearishObDuplicate = false
+    if array.size(bullishOrderBlocks) > 0
+        for index = 0 to array.size(bullishOrderBlocks) - 1
+            OrderBlockZone existingZone = array.get(bullishOrderBlocks, index)
+            bullishObDuplicate := bullishObDuplicate or (not na(bullishObSourceBar) and existingZone.sourceBar == bullishObSourceBar)
+    if array.size(bearishOrderBlocks) > 0
+        for index = 0 to array.size(bearishOrderBlocks) - 1
+            OrderBlockZone existingZone = array.get(bearishOrderBlocks, index)
+            bearishObDuplicate := bearishObDuplicate or (not na(bearishObSourceBar) and existingZone.sourceBar == bearishObSourceBar)
+    if bullishObSetup and not na(bullishObSourceBar) and not bullishObDuplicate
+        while array.size(bullishOrderBlocks) >= maximumActiveOrderBlocks
+            array.shift(bullishOrderBlocks)
+        array.push(bullishOrderBlocks, OrderBlockZone.new(TradeDirection.Long, bullishObSourceTop, bullishObSourceBottom, (bullishObSourceTop + bullishObSourceBottom) * 0.5, bar_index, bullishObSourceBar, true, false, false))
+    if bearishObSetup and not na(bearishObSourceBar) and not bearishObDuplicate
+        while array.size(bearishOrderBlocks) >= maximumActiveOrderBlocks
+            array.shift(bearishOrderBlocks)
+        array.push(bearishOrderBlocks, OrderBlockZone.new(TradeDirection.Short, bearishObSourceTop, bearishObSourceBottom, (bearishObSourceTop + bearishObSourceBottom) * 0.5, bar_index, bearishObSourceBar, true, false, false))
+    latestBullishObTop := na
+    latestBullishObBottom := na
+    latestBullishObMid := na
+    latestBullishObAge := na
+    latestBullishObActive := false
+    nearestBullishObDistance := na
+    insideBullishOrderBlock := false
+    bullishObSupportsRetest := false
+    int latestBullishObCreationBar = na
+    if array.size(bullishOrderBlocks) > 0
+        for index = 0 to array.size(bullishOrderBlocks) - 1
+            OrderBlockZone zone = array.get(bullishOrderBlocks, index)
+            if zone.active
+                float distance = DistanceToFvgZone(close, zone.top, zone.bottom)
+                float retestDistanceToZone = DistanceToFvgZone(retestLevel, zone.top, zone.bottom)
+                if na(latestBullishObCreationBar) or zone.creationBar > latestBullishObCreationBar
+                    latestBullishObTop := zone.top
+                    latestBullishObBottom := zone.bottom
+                    latestBullishObMid := zone.midpoint
+                    latestBullishObAge := bar_index - zone.creationBar
+                    latestBullishObActive := true
+                    latestBullishObCreationBar := zone.creationBar
+                nearestBullishObDistance := na(nearestBullishObDistance) or distance < nearestBullishObDistance ? distance : nearestBullishObDistance
+                insideBullishOrderBlock := insideBullishOrderBlock or distance == 0.0
+                bullishObSupportsRetest := bullishObSupportsRetest or (retestTradeDirection == TradeDirection.Long and (retestState == RetestState.WaitingForRetest or retestState == RetestState.RetestDetected) and not na(retestTolerance) and not na(retestDistanceToZone) and retestDistanceToZone <= retestTolerance)
+    latestBearishObTop := na
+    latestBearishObBottom := na
+    latestBearishObMid := na
+    latestBearishObAge := na
+    latestBearishObActive := false
+    nearestBearishObDistance := na
+    insideBearishOrderBlock := false
+    bearishObSupportsRetest := false
+    int latestBearishObCreationBar = na
+    if array.size(bearishOrderBlocks) > 0
+        for index = 0 to array.size(bearishOrderBlocks) - 1
+            OrderBlockZone zone = array.get(bearishOrderBlocks, index)
+            if zone.active
+                float distance = DistanceToFvgZone(close, zone.top, zone.bottom)
+                float retestDistanceToZone = DistanceToFvgZone(retestLevel, zone.top, zone.bottom)
+                if na(latestBearishObCreationBar) or zone.creationBar > latestBearishObCreationBar
+                    latestBearishObTop := zone.top
+                    latestBearishObBottom := zone.bottom
+                    latestBearishObMid := zone.midpoint
+                    latestBearishObAge := bar_index - zone.creationBar
+                    latestBearishObActive := true
+                    latestBearishObCreationBar := zone.creationBar
+                nearestBearishObDistance := na(nearestBearishObDistance) or distance < nearestBearishObDistance ? distance : nearestBearishObDistance
+                insideBearishOrderBlock := insideBearishOrderBlock or distance == 0.0
+                bearishObSupportsRetest := bearishObSupportsRetest or (retestTradeDirection == TradeDirection.Short and (retestState == RetestState.WaitingForRetest or retestState == RetestState.RetestDetected) and not na(retestTolerance) and not na(retestDistanceToZone) and retestDistanceToZone <= retestTolerance)
+    nearestBullishObDistanceATR := SafeDivide(nearestBullishObDistance, atrValue, na)
+    nearestBearishObDistanceATR := SafeDivide(nearestBearishObDistance, atrValue, na)
+    float candidateRangeHigh = dealingRangeMode == DealingRangeMode.RecentStructure ? trendState.swingHigh : dealingRangeMode == DealingRangeMode.OpeningRange ? rangeState.high : previousDayHigh
+    float candidateRangeLow = dealingRangeMode == DealingRangeMode.RecentStructure ? trendState.swingLow : dealingRangeMode == DealingRangeMode.OpeningRange ? rangeState.low : previousDayLow
+    if dealingRangeMode == DealingRangeMode.RecentStructure and (na(candidateRangeHigh) or na(candidateRangeLow) or candidateRangeHigh <= candidateRangeLow) and rangeState.isComplete
+        candidateRangeHigh := rangeState.high
+        candidateRangeLow := rangeState.low
+    dealingRangeHigh := premiumDiscountEnabled and not na(candidateRangeHigh) and not na(candidateRangeLow) and candidateRangeHigh > candidateRangeLow ? candidateRangeHigh : na
+    dealingRangeLow := premiumDiscountEnabled and not na(candidateRangeHigh) and not na(candidateRangeLow) and candidateRangeHigh > candidateRangeLow ? candidateRangeLow : na
+    dealingRangeEquilibrium := not na(dealingRangeHigh) ? (dealingRangeHigh + dealingRangeLow) * 0.5 : na
+    premiumDiscountState := na(dealingRangeEquilibrium) ? PremiumDiscountState.Unknown : close > dealingRangeEquilibrium + syminfo.mintick ? PremiumDiscountState.Premium : close < dealingRangeEquilibrium - syminfo.mintick ? PremiumDiscountState.Discount : PremiumDiscountState.Equilibrium
+    bullishDiscountSupportsRetest := retestTradeDirection == TradeDirection.Long and (retestState == RetestState.WaitingForRetest or retestState == RetestState.RetestDetected) and premiumDiscountState == PremiumDiscountState.Discount
+    bearishPremiumSupportsRetest := retestTradeDirection == TradeDirection.Short and (retestState == RetestState.WaitingForRetest or retestState == RetestState.RetestDetected) and premiumDiscountState == PremiumDiscountState.Premium
     if not sessionState.isActive and not breakoutConfirmed and not breakoutFailed
         breakoutState := BreakoutState.Invalidated
     else if rangeState.isComplete and not breakoutWindowValid and not breakoutConfirmed and not breakoutFailed
         breakoutState := BreakoutState.Invalidated
+
+bool bullishSweepSupportsRetest = bullishLiquiditySweep and retestTradeDirection == TradeDirection.Long and (retestState == RetestState.WaitingForRetest or retestState == RetestState.RetestDetected)
+bool bearishSweepSupportsRetest = bearishLiquiditySweep and retestTradeDirection == TradeDirection.Short and (retestState == RetestState.WaitingForRetest or retestState == RetestState.RetestDetected)
+int sweepContextAge = not na(sweepBarIndex) ? bar_index - sweepBarIndex : 1000000
+bool bullishRecentSweep = sweepBias == TradeDirection.Long and sweepContextAge <= 10
+bool bearishRecentSweep = sweepBias == TradeDirection.Short and sweepContextAge <= 10
+bool significantSweepSource = sweepSource == LiquiditySource.EqualHigh or sweepSource == LiquiditySource.EqualLow or sweepSource == LiquiditySource.PreviousDayHigh or sweepSource == LiquiditySource.PreviousDayLow or sweepSource == LiquiditySource.PreviousWeekHigh or sweepSource == LiquiditySource.PreviousWeekLow
+float bullishSweepContextScore = math.min(25.0, (bullishLiquiditySweep ? 12.0 : 0.0) + (bullishRecentSweep ? 6.0 : 0.0) + (bullishSweepSupportsRetest ? 4.0 : 0.0) + (bullishRecentSweep and significantSweepSource ? 3.0 : 0.0))
+float bearishSweepContextScore = math.min(25.0, (bearishLiquiditySweep ? 12.0 : 0.0) + (bearishRecentSweep ? 6.0 : 0.0) + (bearishSweepSupportsRetest ? 4.0 : 0.0) + (bearishRecentSweep and significantSweepSource ? 3.0 : 0.0))
+float bullishFvgContextScore = math.min(20.0, (latestBullishFvgActive ? 8.0 : 0.0) + (insideBullishFvg ? 6.0 : 0.0) + (bullishFvgSupportsRetest ? 4.0 : 0.0) + (not na(nearestBullishFvgDistanceATR) and nearestBullishFvgDistanceATR <= 1.0 ? 2.0 : 0.0))
+float bearishFvgContextScore = math.min(20.0, (latestBearishFvgActive ? 8.0 : 0.0) + (insideBearishFvg ? 6.0 : 0.0) + (bearishFvgSupportsRetest ? 4.0 : 0.0) + (not na(nearestBearishFvgDistanceATR) and nearestBearishFvgDistanceATR <= 1.0 ? 2.0 : 0.0))
+float bullishObContextScore = math.min(20.0, (latestBullishObActive ? 8.0 : 0.0) + (insideBullishOrderBlock ? 6.0 : 0.0) + (bullishObSupportsRetest ? 4.0 : 0.0) + (not na(nearestBullishObDistanceATR) and nearestBullishObDistanceATR <= 1.0 ? 2.0 : 0.0))
+float bearishObContextScore = math.min(20.0, (latestBearishObActive ? 8.0 : 0.0) + (insideBearishOrderBlock ? 6.0 : 0.0) + (bearishObSupportsRetest ? 4.0 : 0.0) + (not na(nearestBearishObDistanceATR) and nearestBearishObDistanceATR <= 1.0 ? 2.0 : 0.0))
+float bullishEqualLevelScore = math.min(10.0, (equalLowActive ? 6.0 : 0.0) + (bullishRecentSweep and sweepSource == LiquiditySource.EqualLow ? 4.0 : 0.0))
+float bearishEqualLevelScore = math.min(10.0, (equalHighActive ? 6.0 : 0.0) + (bearishRecentSweep and sweepSource == LiquiditySource.EqualHigh ? 4.0 : 0.0))
+float bullishHtfLiquidityScore = math.min(15.0, (bullishRecentSweep and (sweepSource == LiquiditySource.PreviousDayLow or sweepSource == LiquiditySource.PreviousWeekLow) ? 10.0 : 0.0) + (not na(distanceToPDL) and distanceToPDL <= atrValue ? 3.0 : 0.0) + (not na(distanceToPWL) and distanceToPWL <= atrValue ? 2.0 : 0.0))
+float bearishHtfLiquidityScore = math.min(15.0, (bearishRecentSweep and (sweepSource == LiquiditySource.PreviousDayHigh or sweepSource == LiquiditySource.PreviousWeekHigh) ? 10.0 : 0.0) + (not na(distanceToPDH) and distanceToPDH <= atrValue ? 3.0 : 0.0) + (not na(distanceToPWH) and distanceToPWH <= atrValue ? 2.0 : 0.0))
+float bullishPremiumDiscountScore = bullishDiscountSupportsRetest ? 10.0 : premiumDiscountState == PremiumDiscountState.Discount ? 7.0 : premiumDiscountState == PremiumDiscountState.Equilibrium ? 3.0 : 0.0
+float bearishPremiumDiscountScore = bearishPremiumSupportsRetest ? 10.0 : premiumDiscountState == PremiumDiscountState.Premium ? 7.0 : premiumDiscountState == PremiumDiscountState.Equilibrium ? 3.0 : 0.0
+bullishSmartMoneyScore := math.min(100.0, bullishSweepContextScore + bullishFvgContextScore + bullishObContextScore + bullishEqualLevelScore + bullishHtfLiquidityScore + bullishPremiumDiscountScore)
+bearishSmartMoneyScore := math.min(100.0, bearishSweepContextScore + bearishFvgContextScore + bearishObContextScore + bearishEqualLevelScore + bearishHtfLiquidityScore + bearishPremiumDiscountScore)
+smartMoneyBias := bullishSmartMoneyScore - bearishSmartMoneyScore >= smartMoneyBiasMinimumDifference ? SmartMoneyBias.Bullish : bearishSmartMoneyScore - bullishSmartMoneyScore >= smartMoneyBiasMinimumDifference ? SmartMoneyBias.Bearish : SmartMoneyBias.Neutral
+float dominantSmartMoneyScore = math.max(bullishSmartMoneyScore, bearishSmartMoneyScore)
+smartMoneyStrength := dominantSmartMoneyScore >= 85.0 ? SmartMoneyStrength.Extreme : dominantSmartMoneyScore >= 65.0 ? SmartMoneyStrength.Strong : dominantSmartMoneyScore >= 40.0 ? SmartMoneyStrength.Normal : SmartMoneyStrength.Weak
 
 if na(rangeBox)
     [nextRangeBox, nextRangeHighLine, nextRangeLowLine, nextRangeMidLine, nextRangeHighLabel, nextRangeLowLabel, nextRangeWidthLabel] = CreateRangeDrawings()
@@ -1183,3 +1827,24 @@ plotshape(showRetestMarkers and bearishRetestConfirmed, "Bearish Retest Confirme
 plotshape(showRetestMarkers and bullishRetestFailure, "Bullish Retest Failure", shape.xcross, location.abovebar, color.orange, size = size.small)
 plotshape(showRetestMarkers and bearishRetestFailure, "Bearish Retest Failure", shape.xcross, location.belowbar, color.orange, size = size.small)
 plotchar(showRetestScore and (bullishRetestConfirmed or bearishRetestConfirmed) ? retestScore : na, "Retest Score", "R", location.bottom, color = color.white)
+plot(showPreviousDayLevels ? previousDayHigh : na, "Previous Day High", color = color.new(color.blue, 20), linewidth = 1, style = plot.style_linebr)
+plot(showPreviousDayLevels ? previousDayLow : na, "Previous Day Low", color = color.new(color.blue, 20), linewidth = 1, style = plot.style_linebr)
+plot(showPreviousDayLevels ? previousDayClose : na, "Previous Day Close", color = color.new(color.blue, 55), linewidth = 1, style = plot.style_linebr)
+plot(showPreviousDayLevels ? previousDayMid : na, "Previous Day Mid", color = color.new(color.blue, 70), linewidth = 1, style = plot.style_linebr)
+plot(showPreviousWeekLevels ? previousWeekHigh : na, "Previous Week High", color = color.new(color.purple, 20), linewidth = 1, style = plot.style_linebr)
+plot(showPreviousWeekLevels ? previousWeekLow : na, "Previous Week Low", color = color.new(color.purple, 20), linewidth = 1, style = plot.style_linebr)
+plot(showPreviousWeekLevels ? previousWeekClose : na, "Previous Week Close", color = color.new(color.purple, 55), linewidth = 1, style = plot.style_linebr)
+plot(showPreviousWeekLevels ? previousWeekMid : na, "Previous Week Mid", color = color.new(color.purple, 70), linewidth = 1, style = plot.style_linebr)
+plot(showEqualHighsLows and equalHighActive ? equalHighLevel : na, "Equal Highs", color = color.orange, linewidth = 2, style = plot.style_linebr)
+plot(showEqualHighsLows and equalLowActive ? equalLowLevel : na, "Equal Lows", color = color.aqua, linewidth = 2, style = plot.style_linebr)
+plotshape(showLiquiditySweeps and bullishLiquiditySweep, "Bullish Liquidity Sweep", shape.triangleup, location.belowbar, color.lime, size = size.small)
+plotshape(showLiquiditySweeps and bearishLiquiditySweep, "Bearish Liquidity Sweep", shape.triangledown, location.abovebar, color.red, size = size.small)
+plot(showFvgZones and latestBullishFvgActive ? latestBullishFvgTop : na, "Bullish FVG Top", color = color.new(color.lime, 35), style = plot.style_linebr)
+plot(showFvgZones and latestBullishFvgActive ? latestBullishFvgBottom : na, "Bullish FVG Bottom", color = color.new(color.lime, 35), style = plot.style_linebr)
+plot(showFvgZones and latestBearishFvgActive ? latestBearishFvgTop : na, "Bearish FVG Top", color = color.new(color.red, 35), style = plot.style_linebr)
+plot(showFvgZones and latestBearishFvgActive ? latestBearishFvgBottom : na, "Bearish FVG Bottom", color = color.new(color.red, 35), style = plot.style_linebr)
+plot(showOrderBlocks and latestBullishObActive ? latestBullishObMid : na, "Bullish OB Mid", color = color.new(color.aqua, 20), linewidth = 2, style = plot.style_linebr)
+plot(showOrderBlocks and latestBearishObActive ? latestBearishObMid : na, "Bearish OB Mid", color = color.new(color.orange, 20), linewidth = 2, style = plot.style_linebr)
+plot(showPremiumDiscount ? dealingRangeHigh : na, "Dealing Range High", color = color.new(color.purple, 35), style = plot.style_linebr)
+plot(showPremiumDiscount ? dealingRangeLow : na, "Dealing Range Low", color = color.new(color.purple, 35), style = plot.style_linebr)
+plot(showPremiumDiscount ? dealingRangeEquilibrium : na, "Dealing Range Equilibrium", color = color.new(color.gray, 30), style = plot.style_linebr)
