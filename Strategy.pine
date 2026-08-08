@@ -194,6 +194,7 @@ var OpeningRangeState rangeState = OpeningRangeState.new(na, na, na, na, na, na,
 var TradeControlState tradeControl = TradeControlState.new(false, false, false, false)
 var SessionStatistics sessionStatistics = SessionStatistics.new(0, 0.0, na, na, 0.0, 0, 0, 0)
 var TrendEngineState trendState = TrendEngineState.new(TrendDirection.Neutral, TrendStrength.Weak, MarketStructure.Neutral, 0.0, na, na, na, na, na, na, na, na, na, na, na, na, false, false)
+// M2 Session/Opening Range state. The M3 Trend Engine neither reads nor updates it.
 var BreakoutState breakoutState = BreakoutState.Waiting
 var int breakoutDirection = 0
 var float atrAtRangeCompletion = na
@@ -405,16 +406,16 @@ CalculateOpeningRange(OpeningRangeState previousRange, float atrValue) =>
     float nextPercent = SafeDivide(nextWidth * 100.0, nextMid, na)
     float nextTicks = SafeDivide(nextWidth, syminfo.mintick, na)
     float nextAtrAtCompletion = na
-    BreakoutState nextBreakoutState = breakoutState
+    BreakoutState rangeCompletionState = breakoutState
     bool nextQualityAccepted = previousRange.qualityAccepted
     if previousRange.isBuilding and not rangeBar
         nextBuilding := false
         nextComplete := true
         nextAtrAtCompletion := atrValue
         nextQualityAccepted := nextAtrRatio >= minimumAtrRatio and nextAtrRatio <= maximumAtrRatio
-        nextBreakoutState := BreakoutState.RangeCompleted
+        rangeCompletionState := BreakoutState.RangeCompleted
     OpeningRangeState nextRange = OpeningRangeState.new(nextHigh, nextLow, nextMid, nextWidth, nextAtrRatio, nextPercent, nextTicks, previousRange.startTime, previousRange.endTime, nextBars, nextBuilding, nextComplete, nextQualityAccepted)
-    [nextRange, nextAtrAtCompletion, nextBreakoutState]
+    [nextRange, nextAtrAtCompletion, rangeCompletionState]
 
 // Calculates aggregate statistics after one completed opening range.
 CalculateCompletedRangeStatistics(SessionStatistics previousStatistics, OpeningRangeState completedRange) =>
@@ -632,21 +633,21 @@ if barstate.isconfirmed
         tradeControl.sessionLocked := true
         breakoutState := BreakoutState.SessionFinished
     if enabled and symbolMatches and sessionState.justStarted
-        [nextRangeState, nextTradeControl, nextBreakoutDirection, nextAtrAtCompletion, nextBreakoutState] = CreateSessionRange()
-        rangeState := nextRangeState
-        tradeControl := nextTradeControl
-        breakoutDirection := nextBreakoutDirection
-        atrAtRangeCompletion := nextAtrAtCompletion
-        breakoutState := nextBreakoutState
+        [resetRangeState, resetTradeControl, resetBreakoutDirection, resetAtrAtCompletion, resetBreakoutState] = CreateSessionRange()
+        rangeState := resetRangeState
+        tradeControl := resetTradeControl
+        breakoutDirection := resetBreakoutDirection
+        atrAtRangeCompletion := resetAtrAtCompletion
+        breakoutState := resetBreakoutState
     if enabled and symbolMatches and sessionState.isActive
-        [nextRangeState, nextAtrAtCompletion, nextBreakoutState] = CalculateOpeningRange(rangeState, atrValue)
-        rangeState := nextRangeState
-        atrAtRangeCompletion := nextAtrAtCompletion
-        breakoutState := nextBreakoutState
-        [nextBreakoutDirection, nextBreakoutState, nextSessionStatistics] = CalculateBreakoutState(rangeState, breakoutState, breakoutDirection, sessionStatistics)
-        breakoutDirection := nextBreakoutDirection
-        breakoutState := nextBreakoutState
-        sessionStatistics := nextSessionStatistics
+        [calculatedRangeState, calculatedAtrAtCompletion, calculatedRangeBreakoutState] = CalculateOpeningRange(rangeState, atrValue)
+        rangeState := calculatedRangeState
+        atrAtRangeCompletion := calculatedAtrAtCompletion
+        breakoutState := calculatedRangeBreakoutState
+        [calculatedBreakoutDirection, calculatedBreakoutState, calculatedSessionStatistics] = CalculateBreakoutState(rangeState, breakoutState, breakoutDirection, sessionStatistics)
+        breakoutDirection := calculatedBreakoutDirection
+        breakoutState := calculatedBreakoutState
+        sessionStatistics := calculatedSessionStatistics
 
 if na(rangeBox)
     [nextRangeBox, nextRangeHighLine, nextRangeLowLine, nextRangeMidLine, nextRangeHighLabel, nextRangeLowLabel, nextRangeWidthLabel] = CreateRangeDrawings()
