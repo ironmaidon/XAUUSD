@@ -1,11 +1,14 @@
 //@version=6
 // XAUUSD Institutional Framework
-// Version: 0.9.0
+// Version: 0.10.0
 //
 // Session and Opening Range engine. Every state mutation happens on confirmed
 // bars, so the engine never uses future values or repainting calculations.
 //
 // Changelog:
+// - 0.10.0: Added an M10 consolidated production dashboard with Compact,
+//           Standard, and Detailed layouts, semantic coloring, M2-M9
+//           diagnostics, trade levels, and event-only chart markers.
 // - 0.9.0: Added M9-A event-driven entry execution with fixed initial stop and
 //          target orders, M9-B partial-target lifecycle and residual-stop
 //          protection tracking, M9-C breakeven management after TP1, and M9-D
@@ -36,7 +39,7 @@
 //============================================================================== 
 // 1. STRATEGY DECLARATION
 //============================================================================== 
-strategy("XAUUSD Institutional Framework v0.9.0", "XAUUSD v0.9.0", overlay = true,
+strategy("XAUUSD Institutional Framework v0.10.0", "XAUUSD v0.10.0", overlay = true,
      pyramiding = 0, calc_on_every_tick = false, calc_on_order_fills = false,
      process_orders_on_close = true, initial_capital = 10000, currency = currency.USD,
      default_qty_type = strategy.percent_of_equity, default_qty_value = 1)
@@ -44,8 +47,8 @@ strategy("XAUUSD Institutional Framework v0.9.0", "XAUUSD v0.9.0", overlay = tru
 //============================================================================== 
 // 2. CONSTANTS AND ENUMS
 //============================================================================== 
-string STRATEGY_VERSION = "0.9.0"
-string DASHBOARD_TITLE = "XAUUSD SESSION ENGINE"
+string STRATEGY_VERSION = "0.10.0"
+string DASHBOARD_TITLE = "XAUUSD PRODUCTION MONITOR"
 int MILLISECONDS_PER_MINUTE = 60000
 int ATR_LENGTH = 14
 float TRADE_PROFIT_TOLERANCE = 0.01
@@ -312,6 +315,27 @@ enum TradeExitReason
     TrailingStop
     Other
 
+// M10 fixed table placement options. Inputs reload the script, so the primary
+// table remains a single instance for each selected configuration.
+enum DashboardPosition
+    TopRight
+    TopLeft
+    BottomRight
+    BottomLeft
+
+// M10 layout density. The table keeps fixed maximum capacity and clears unused
+// rows on each last-bar update.
+enum DashboardDetailLevel
+    Compact
+    Standard
+    Detailed
+
+// M10 presentation text size.
+enum DashboardSize
+    Small
+    Normal
+    Large
+
 //============================================================================== 
 // 3. INPUTS
 //============================================================================== 
@@ -337,6 +361,7 @@ string GROUP_TRADE_SCORING = "19. Trade Scoring Engine"
 string GROUP_TRADE_SCORING_VISUALS = "20. Trade Scoring Visuals"
 string GROUP_RISK_MANAGEMENT = "21. M8 — Risk Management"
 string GROUP_TRADE_MANAGEMENT = "22. M9 — Trade Management"
+string GROUP_M10_DASHBOARD = "23. M10 — Dashboard & Visualization"
 
 bool enabled = input.bool(true, "Enable strategy", group = GROUP_GENERAL)
 string expectedSymbol = input.string("XAUUSD", "Expected symbol", group = GROUP_GENERAL)
@@ -372,8 +397,15 @@ bool showRangeBorder = input.bool(true, "Draw range border", group = GROUP_VISUA
 bool showRangeLines = input.bool(true, "Draw high, low, and mid", group = GROUP_VISUALS)
 bool showRangeLabels = input.bool(true, "Draw range labels", group = GROUP_VISUALS)
 
-bool showDashboard = input.bool(true, "Show dashboard", group = GROUP_DASHBOARD)
 bool debugEnabled = input.bool(false, "Show debug panel", group = GROUP_DASHBOARD)
+bool showDashboard = input.bool(true, "Show Dashboard", group = GROUP_M10_DASHBOARD)
+DashboardPosition dashboardPosition = input.enum(DashboardPosition.TopRight, "Dashboard Position", group = GROUP_M10_DASHBOARD)
+DashboardSize dashboardSize = input.enum(DashboardSize.Normal, "Dashboard Size", group = GROUP_M10_DASHBOARD)
+DashboardDetailLevel dashboardDetailLevel = input.enum(DashboardDetailLevel.Standard, "Dashboard Detail Level", group = GROUP_M10_DASHBOARD)
+bool showChartVisuals = input.bool(true, "Show Chart Visuals", group = GROUP_M10_DASHBOARD)
+bool showTradeLevels = input.bool(true, "Show Trade Levels", group = GROUP_M10_DASHBOARD)
+bool showSignalMarkers = input.bool(true, "Show Signal Markers", group = GROUP_M10_DASHBOARD)
+bool showSmartMoneyVisuals = input.bool(true, "Show Smart Money Visuals", group = GROUP_M10_DASHBOARD)
 
 bool emaFilterEnabled = input.bool(true, "Enable EMA filter", group = GROUP_TREND)
 int fastEmaLength = input.int(50, "Fast EMA length", minval = 1, group = GROUP_TREND)
@@ -763,6 +795,7 @@ var SmartMoneyBias smartMoneyBias = SmartMoneyBias.Neutral
 var SmartMoneyStrength smartMoneyStrength = SmartMoneyStrength.Weak
 var string smartMoneyBiasDashboardText = "Neutral"
 var string smartMoneyStrengthDashboardText = "Weak"
+var color smartMoneyBiasDashboardColor = color.silver
 var float bullishTradeScore = 0.0
 var float bearishTradeScore = 0.0
 var float bullishTradeScoreRawDisplay = na
@@ -901,6 +934,7 @@ var string lastTradeEntryId = ""
 var string lastTradeExitId = ""
 var TradeOutcome lastTradeOutcome = TradeOutcome.None
 var TradeExitReason lastTradeExitReason = TradeExitReason.None
+var color lastTradeOutcomeDashboardColor = color.silver
 var bool tradeClosedEvent = false
 var bool tradeWinEvent = false
 var bool tradeLossEvent = false
@@ -1020,7 +1054,55 @@ FormatPrice(float price) =>
 
 // Formats a decimal number as a concise percentage string.
 FormatPercent(float value) =>
-    na(value) ? "n/a" : str.tostring(value, "#.##") + "%"
+    na(value) ? "-" : str.tostring(value, "#.##") + "%"
+
+// Formats a cash value for concise dashboard presentation.
+FormatCurrency(float value) =>
+    na(value) ? "-" : "$" + str.tostring(value, "#.##")
+
+// Formats a normalized score without changing its underlying value.
+FormatScore(float value) =>
+    na(value) ? "-" : str.tostring(value, "#.##")
+
+// Formats a nullable ATR multiple.
+FormatAtrMultiple(float value) =>
+    na(value) ? "-" : str.tostring(value, "#.##") + " ATR"
+
+// Formats a nullable position quantity.
+FormatQuantity(float value) =>
+    na(value) ? "-" : str.tostring(value, "#.####")
+
+// Formats a nullable realized R multiple.
+FormatRMultiple(float value) =>
+    na(value) ? "-" : str.tostring(value, "#.##") + "R"
+
+// Maps the M10 position enum to a valid Pine table position.
+DashboardTablePosition() =>
+    dashboardPosition == DashboardPosition.TopLeft ? position.top_left : dashboardPosition == DashboardPosition.BottomRight ? position.bottom_right : dashboardPosition == DashboardPosition.BottomLeft ? position.bottom_left : position.top_right
+
+// Maps the M10 size enum to a valid Pine table text size.
+DashboardTextSize() =>
+    dashboardSize == DashboardSize.Small ? size.small : dashboardSize == DashboardSize.Large ? size.large : size.normal
+
+// Returns a semantic presentation color for a normalized score.
+ScoreColor(float score) =>
+    na(score) ? color.silver : score >= 80.0 ? color.lime : score >= 65.0 ? color.teal : score >= 50.0 ? color.orange : color.red
+
+// Returns a semantic direction color for M7/M9 trade bias values.
+TradeBiasColor(series TradeBias bias) =>
+    bias == TradeBias.Bullish ? color.lime : bias == TradeBias.Bearish ? color.red : color.silver
+
+// Returns a semantic direction color for M3 trend values.
+TrendDirectionColor(series TrendDirection direction) =>
+    direction == TrendDirection.Bullish ? color.lime : direction == TrendDirection.Bearish ? color.red : color.silver
+
+// Returns a semantic direction color for M4/M5 trade directions.
+TradeDirectionColor(series TradeDirection direction) =>
+    direction == TradeDirection.Long ? color.lime : direction == TradeDirection.Short ? color.red : color.silver
+
+// Returns a consistent pass/fail color.
+BooleanStatusColor(bool value) =>
+    value ? color.lime : color.red
 
 // Converts the opening-range input selection into an integer minute duration.
 OpeningRangeMinutes() =>
@@ -1322,7 +1404,7 @@ CreateRangeDrawings() =>
 UpdateRangeDrawings() =>
     bool hasRange = not na(rangeState.high) and not na(rangeState.low)
     int leftBar = math.max(0, bar_index - rangeState.bars + 1)
-    if hasRange and showRangeBox
+    if hasRange and showChartVisuals and showRangeBox
         box.set_lefttop(rangeBox, leftBar, rangeState.high)
         box.set_rightbottom(rangeBox, bar_index, rangeState.low)
         box.set_bgcolor(rangeBox, color.new(rangeColor, rangeTransparency))
@@ -1330,7 +1412,7 @@ UpdateRangeDrawings() =>
     else
         box.set_bgcolor(rangeBox, color.new(rangeColor, 100))
         box.set_border_color(rangeBox, color.new(rangeColor, 100))
-    if hasRange and showRangeLines
+    if hasRange and showChartVisuals and showRangeLines
         line.set_xy1(rangeHighLine, leftBar, rangeState.high)
         line.set_xy2(rangeHighLine, bar_index, rangeState.high)
         line.set_xy1(rangeLowLine, leftBar, rangeState.low)
@@ -1344,7 +1426,7 @@ UpdateRangeDrawings() =>
         line.set_color(rangeHighLine, color.new(rangeColor, 100))
         line.set_color(rangeLowLine, color.new(rangeColor, 100))
         line.set_color(rangeMidLine, color.new(rangeColor, 100))
-    if hasRange and showRangeLabels
+    if hasRange and showChartVisuals and showRangeLabels
         label.set_xy(rangeHighLabel, bar_index, rangeState.high)
         label.set_text(rangeHighLabel, "OR High " + FormatPrice(rangeState.high))
         label.set_xy(rangeLowLabel, bar_index, rangeState.low)
@@ -1371,7 +1453,7 @@ TrendColor() =>
 // Calculates the reusable trend-label reference without mutating global state.
 CalculateTrendLabel(label previousLabel) =>
     label nextLabel = previousLabel
-    if showTrendLabel and barstate.islast
+    if showChartVisuals and showTrendLabel and barstate.islast
         string labelText = TrendDirectionText(GetTrendDirection()) + " " + str.tostring(GetTrendScore(), "#.##") + " / " + TrendStrengthText(trendState.strength)
         if na(nextLabel)
             nextLabel := label.new(bar_index, high, labelText, style = label.style_label_down, color = TrendColor(), textcolor = color.white, size = size.small)
@@ -1386,136 +1468,118 @@ CalculateTrendLabel(label previousLabel) =>
 //============================================================================== 
 // 11. DASHBOARD AND DEBUG
 //============================================================================== 
-var table dashboard = table.new(position.top_right, 2, 116, border_width = 1)
+var table dashboard = table.new(DashboardTablePosition(), 2, 96, border_width = 1)
 var table debugTable = table.new(position.bottom_right, 2, 6, border_width = 1)
 
-// Writes one consistently styled dashboard row.
+// Writes one consistently styled M10 dashboard row.
 SetDashboardRow(table target, int row, string caption, string value) =>
-    table.cell(target, 0, row, caption, text_color = color.silver, bgcolor = color.new(color.black, 15), text_size = size.small)
-    table.cell(target, 1, row, value, text_color = color.white, bgcolor = color.new(color.black, 65), text_size = size.small)
+    table.cell(target, 0, row, caption, text_color = color.silver, bgcolor = color.new(color.black, 15), text_size = DashboardTextSize())
+    table.cell(target, 1, row, value, text_color = color.white, bgcolor = color.new(color.black, 65), text_size = DashboardTextSize())
 
-// Updates the session dashboard only on the last chart bar.
+// Writes a semantic-status row without changing the data that it presents.
+SetDashboardStatusRow(table target, int row, string caption, string value, color valueColor) =>
+    table.cell(target, 0, row, caption, text_color = color.silver, bgcolor = color.new(color.black, 15), text_size = DashboardTextSize())
+    table.cell(target, 1, row, value, text_color = valueColor, bgcolor = color.new(color.black, 65), text_size = DashboardTextSize())
+
+// Writes a concise M10 section header in the existing two-column table.
+SetDashboardSection(table target, int row, string caption) =>
+    table.cell(target, 0, row, "[ " + caption + " ]", text_color = color.aqua, bgcolor = color.new(color.navy, 25), text_size = DashboardTextSize())
+    table.cell(target, 1, row, "", text_color = color.aqua, bgcolor = color.new(color.navy, 25), text_size = DashboardTextSize())
+
+// Updates the fixed-capacity M10 dashboard only on the last chart bar.
 UpdateDashboard() =>
     if barstate.islast
         if showDashboard
+            table.clear(dashboard, 0, 0, 1, 95)
             SetDashboardRow(dashboard, 0, DASHBOARD_TITLE, "v" + STRATEGY_VERSION)
-            SetDashboardRow(dashboard, 1, "Current session", SessionText(sessionState.currentSession))
-            SetDashboardRow(dashboard, 2, "Current state", StateText(breakoutState))
-            SetDashboardRow(dashboard, 3, "Range width", FormatPrice(rangeState.width))
-            SetDashboardRow(dashboard, 4, "ATR ratio", str.tostring(rangeState.atrRatio, "#.##"))
-            SetDashboardRow(dashboard, 5, "Session progress", FormatPercent(sessionState.progressPercent))
-            SetDashboardRow(dashboard, 6, "Bars in session", str.tostring(sessionState.barsInSession))
-            SetDashboardRow(dashboard, 7, "Bars remaining", str.tostring(sessionState.barsRemaining))
-            SetDashboardRow(dashboard, 8, "Current trend", TrendDirectionText(GetTrendDirection()))
-            SetDashboardRow(dashboard, 9, "Trend score", str.tostring(GetTrendScore(), "#.##"))
-            SetDashboardRow(dashboard, 10, "EMA direction", trendState.fastEma > trendState.slowEma ? "Bullish" : trendState.fastEma < trendState.slowEma ? "Bearish" : "Neutral")
-            SetDashboardRow(dashboard, 11, "HTF direction", trendState.htfFastEma > trendState.htfSlowEma ? "Bullish" : trendState.htfFastEma < trendState.htfSlowEma ? "Bearish" : "Neutral")
-            SetDashboardRow(dashboard, 12, "VWAP status", close > trendState.vwapValue ? "Above" : close < trendState.vwapValue ? "Below" : "At VWAP")
-            SetDashboardRow(dashboard, 13, "ADX", str.tostring(trendState.adx, "#.##"))
-            SetDashboardRow(dashboard, 14, "Structure", MarketStructureText(GetMarketStructure()))
-            SetDashboardRow(dashboard, 15, "Breakout state", StateText(breakoutState))
-            SetDashboardRow(dashboard, 16, "Breakout direction", BreakoutDirectionText(breakoutTradeDirection))
-            SetDashboardRow(dashboard, 17, "Breakout score", na(breakoutScore) ? "-" : str.tostring(breakoutScore, "#.##"))
-            SetDashboardRow(dashboard, 18, "Breakout strength", BreakoutStrengthText(breakoutStrength))
-            SetDashboardRow(dashboard, 19, "Distance ATR", na(breakoutDistanceATR) ? "-" : str.tostring(breakoutDistanceATR, "#.##"))
-            SetDashboardRow(dashboard, 20, "Breakout attempted", breakoutAttempted ? "Yes" : "No")
-            SetDashboardRow(dashboard, 21, "Breakout confirmed", breakoutConfirmed ? "Yes" : "No")
-            SetDashboardRow(dashboard, 22, "Breakout failed", breakoutFailed ? "Yes" : "No")
-            SetDashboardRow(dashboard, 23, "Retest state", RetestStateText(retestState))
-            SetDashboardRow(dashboard, 24, "Retest direction", RetestDirectionText(retestTradeDirection))
-            SetDashboardRow(dashboard, 25, "Retest level", na(retestLevel) ? "-" : FormatPrice(retestLevel))
-            SetDashboardRow(dashboard, 26, "Retest score", FormatValueOrDash(retestScore))
-            SetDashboardRow(dashboard, 27, "Retest attempts", str.tostring(retestAttemptCount))
-            SetDashboardRow(dashboard, 28, "Retry pending", retestRetryPending ? "Yes" : "No")
-            SetDashboardRow(dashboard, 29, "Bars since breakout", FormatIntOrDash(retestBarsSinceBreakout))
-            SetDashboardRow(dashboard, 30, "Retest distance ATR", FormatValueOrDash(retestDistanceATR))
-            SetDashboardRow(dashboard, 31, "Retest penetration ATR", FormatValueOrDash(retestPenetrationATR))
-            SetDashboardRow(dashboard, 32, "Retest confirmed", retestConfirmed ? "Yes" : "No")
-            SetDashboardRow(dashboard, 33, "Retest failed", retestFailed ? "Yes" : "No")
-            SetDashboardRow(dashboard, 34, "Smart Money bias", smartMoneyBiasDashboardText)
-            SetDashboardRow(dashboard, 35, "SMC strength", smartMoneyStrengthDashboardText)
-            SetDashboardRow(dashboard, 36, "Bullish SMC score", showSmartMoneyScore ? FormatValueOrDash(bullishSmartMoneyScore) : "-")
-            SetDashboardRow(dashboard, 37, "Bearish SMC score", showSmartMoneyScore ? FormatValueOrDash(bearishSmartMoneyScore) : "-")
-            SetDashboardRow(dashboard, 38, "Liquidity sweep", bullishLiquiditySweep ? "Bullish" : bearishLiquiditySweep ? "Bearish" : "-")
-            SetDashboardRow(dashboard, 39, "Sweep source", LiquiditySourceText(sweepSource))
-            SetDashboardRow(dashboard, 40, "Sweep strength", SweepStrengthText(sweepStrength))
-            SetDashboardRow(dashboard, 41, "Bullish FVG", latestBullishFvgActive ? "Active" : "-")
-            SetDashboardRow(dashboard, 42, "Bearish FVG", latestBearishFvgActive ? "Active" : "-")
-            SetDashboardRow(dashboard, 43, "Bullish OB", latestBullishObActive ? "Active" : "-")
-            SetDashboardRow(dashboard, 44, "Bearish OB", latestBearishObActive ? "Active" : "-")
-            SetDashboardRow(dashboard, 45, "Premium / Discount", PremiumDiscountText(premiumDiscountState))
-            SetDashboardRow(dashboard, 46, "Equal high", equalHighActive ? "Active" : "-")
-            SetDashboardRow(dashboard, 47, "Equal low", equalLowActive ? "Active" : "-")
-            SetDashboardRow(dashboard, 48, "PDH / PDL", priceAbovePDH ? "Above PDH" : priceBelowPDL ? "Below PDL" : "Between")
-            SetDashboardRow(dashboard, 49, "PWH / PWL", priceAbovePWH ? "Above PWH" : priceBelowPWL ? "Below PWL" : "Between")
-            SetDashboardRow(dashboard, 50, "Trade setup state", tradeSetupStateDashboardText)
-            SetDashboardRow(dashboard, 51, "Trade bias", tradeBiasDashboardText)
-            SetDashboardRow(dashboard, 52, "Setup strength", tradeSetupStrengthDashboardText)
-            SetDashboardRow(dashboard, 53, "Setup score", FormatValueOrDash(tradeSetupScore))
-            SetDashboardRow(dashboard, 54, "Bullish raw score", showRawVsAdjustedScore ? FormatValueOrDash(bullishTradeScoreRawDisplay) : "-")
-            SetDashboardRow(dashboard, 55, "Bearish raw score", showRawVsAdjustedScore ? FormatValueOrDash(bearishTradeScoreRawDisplay) : "-")
-            SetDashboardRow(dashboard, 56, "Bullish adjusted score", showRawVsAdjustedScore ? FormatValueOrDash(bullishTradeScore) : "-")
-            SetDashboardRow(dashboard, 57, "Bearish adjusted score", showRawVsAdjustedScore ? FormatValueOrDash(bearishTradeScore) : "-")
-            SetDashboardRow(dashboard, 58, "Bullish penalty", showRawVsAdjustedScore ? FormatValueOrDash(bullishTradePenaltyDisplay) : "-")
-            SetDashboardRow(dashboard, 59, "Bearish penalty", showRawVsAdjustedScore ? FormatValueOrDash(bearishTradePenaltyDisplay) : "-")
-            SetDashboardRow(dashboard, 60, "Bullish mandatory gates", bullishMandatoryGateDisplay ? "Pass" : "Fail")
-            SetDashboardRow(dashboard, 61, "Bearish mandatory gates", bearishMandatoryGateDisplay ? "Pass" : "Fail")
-            SetDashboardRow(dashboard, 62, "Bullish candidate", bullishTradeCandidateDisplay ? "Yes" : "No")
-            SetDashboardRow(dashboard, 63, "Bearish candidate", bearishTradeCandidateDisplay ? "Yes" : "No")
-            SetDashboardRow(dashboard, 64, "Bullish qualified", bullishTradeQualified ? "Yes" : "No")
-            SetDashboardRow(dashboard, 65, "Bearish qualified", bearishTradeQualified ? "Yes" : "No")
-            SetDashboardRow(dashboard, 66, "Directional score difference", FormatValueOrDash(tradeScoreDifferenceDisplay))
-            SetDashboardRow(dashboard, 67, "Risk context active", riskContextActive ? "Yes" : "No")
-            SetDashboardRow(dashboard, 68, "Risk direction", riskDirectionDashboardText)
-            SetDashboardRow(dashboard, 69, "Risk entry", FormatValueOrDash(riskEntryPrice))
-            SetDashboardRow(dashboard, 70, "Risk stop", FormatValueOrDash(riskStopPrice))
-            SetDashboardRow(dashboard, 71, "Stop source", riskStopSourceDashboardText)
-            SetDashboardRow(dashboard, 72, "Risk distance ATR", FormatValueOrDash(riskDistanceATR))
-            SetDashboardRow(dashboard, 73, "Sizing equity", FormatValueOrDash(riskSizingEquity))
-            SetDashboardRow(dashboard, 74, "Target cash risk", FormatValueOrDash(riskCashAmount))
-            SetDashboardRow(dashboard, 75, "Position quantity", FormatValueOrDash(riskQuantity))
-            SetDashboardRow(dashboard, 76, "Actual cash risk", FormatValueOrDash(riskActualCashAmount))
-            SetDashboardRow(dashboard, 77, "Actual risk %", FormatValueOrDash(riskActualPercent))
-            SetDashboardRow(dashboard, 78, "TP1", FormatValueOrDash(riskTP1))
-            SetDashboardRow(dashboard, 79, "TP2", FormatValueOrDash(riskTP2))
-            SetDashboardRow(dashboard, 80, "RR1", FormatValueOrDash(riskRR1))
-            SetDashboardRow(dashboard, 81, "RR2", FormatValueOrDash(riskRR2))
-            SetDashboardRow(dashboard, 82, "Base risk approved", baseRiskApproved ? "Yes" : "No")
-            SetDashboardRow(dashboard, 83, "Final risk approved", riskApproved ? "Yes" : "No")
-            SetDashboardRow(dashboard, 84, "Daily allocated risk %", FormatValueOrDash(dailyAllocatedRiskPercent))
-            SetDashboardRow(dashboard, 85, "Daily P/L %", FormatValueOrDash(dailyPnLPercent))
-            SetDashboardRow(dashboard, 86, "Daily approved setups", str.tostring(dailyApprovedSetupCount))
-            SetDashboardRow(dashboard, 87, "Session allocated risk %", FormatValueOrDash(sessionAllocatedRiskPercent))
-            SetDashboardRow(dashboard, 88, "Session approved setups", str.tostring(sessionApprovedSetupCount))
-            SetDashboardRow(dashboard, 89, "Consecutive losses", str.tostring(consecutiveLossCount))
-            SetDashboardRow(dashboard, 90, "Risk guard pass", riskGuardPass ? "Yes" : "No")
-            SetDashboardRow(dashboard, 91, "Risk block reason", riskBlockReasonDashboardText)
-            SetDashboardRow(dashboard, 92, "Trade active", tradeActive ? "Yes" : "No")
-            SetDashboardRow(dashboard, 93, "Active direction", TradeBiasText(activeTradeDirection))
-            SetDashboardRow(dashboard, 94, "Planned entry", FormatValueOrDash(tradePlannedEntry))
-            SetDashboardRow(dashboard, 95, "Actual entry", FormatValueOrDash(tradeActualEntry))
-            SetDashboardRow(dashboard, 96, "Initial stop", FormatValueOrDash(tradeInitialStop))
-            SetDashboardRow(dashboard, 97, "Effective stop", FormatValueOrDash(tradeEffectiveStop))
-            SetDashboardRow(dashboard, 98, "Active stop mode", ActiveStopModeText(activeStopMode))
-            SetDashboardRow(dashboard, 99, "Trade TP1", FormatValueOrDash(tradeTP1))
-            SetDashboardRow(dashboard, 100, "Trade TP2", FormatValueOrDash(tradeTP2))
-            SetDashboardRow(dashboard, 101, "TP1 hit", tradeTP1Hit ? "Yes" : "No")
-            SetDashboardRow(dashboard, 102, "TP2 hit", tradeTP2Hit ? "Yes" : "No")
-            SetDashboardRow(dashboard, 103, "Breakeven active", breakevenActivated ? "Yes" : "No")
-            SetDashboardRow(dashboard, 104, "Trailing active", trailingActivated ? "Yes" : "No")
-            SetDashboardRow(dashboard, 105, "Remaining quantity", FormatValueOrDash(tradeRemainingQuantity))
-            SetDashboardRow(dashboard, 106, "Last trade outcome", TradeOutcomeText(lastTradeOutcome))
-            SetDashboardRow(dashboard, 107, "Last trade profit", FormatValueOrDash(lastTradeProfit))
-            SetDashboardRow(dashboard, 108, "Last trade R", FormatValueOrDash(lastTradeRMultiple))
-            SetDashboardRow(dashboard, 109, "Last exit reason", TradeExitReasonText(lastTradeExitReason))
-            SetDashboardRow(dashboard, 110, "Daily executed trades", str.tostring(dailyExecutedTradeCount))
-            SetDashboardRow(dashboard, 111, "Session executed trades", str.tostring(sessionExecutedTradeCount))
-            SetDashboardRow(dashboard, 112, "Total executed trades", str.tostring(totalExecutedTradeCount))
-            SetDashboardRow(dashboard, 113, "Daily realized P/L", FormatValueOrDash(dailyRealizedTradeProfit))
-            SetDashboardRow(dashboard, 114, "Session realized P/L", FormatValueOrDash(sessionRealizedTradeProfit))
-            SetDashboardRow(dashboard, 115, "Last trade P/L %", FormatPercent(lastTradeProfitPercent))
+            if dashboardDetailLevel == DashboardDetailLevel.Compact
+                SetDashboardStatusRow(dashboard, 1, "Session", SessionText(sessionState.currentSession), sessionState.isActive ? color.lime : color.silver)
+                SetDashboardStatusRow(dashboard, 2, "Trend", TrendDirectionText(GetTrendDirection()), TrendDirectionColor(GetTrendDirection()))
+                SetDashboardStatusRow(dashboard, 3, "Breakout", StateText(breakoutState), TradeDirectionColor(breakoutTradeDirection))
+                SetDashboardStatusRow(dashboard, 4, "Retest", RetestStateText(retestState), TradeDirectionColor(retestTradeDirection))
+                SetDashboardStatusRow(dashboard, 5, "SMC Bias", smartMoneyBiasDashboardText, smartMoneyBiasDashboardColor)
+                SetDashboardStatusRow(dashboard, 6, "Trade Bias", tradeBiasDashboardText, TradeBiasColor(tradeBias))
+                SetDashboardStatusRow(dashboard, 7, "Setup Score", FormatScore(tradeSetupScore), ScoreColor(tradeSetupScore))
+                SetDashboardStatusRow(dashboard, 8, "Risk Approval", riskApproved ? "APPROVED" : "BLOCKED", BooleanStatusColor(riskApproved))
+                SetDashboardStatusRow(dashboard, 9, "Trade Active", tradeActive ? "ACTIVE" : "OFF", tradeActive ? color.lime : color.silver)
+                SetDashboardRow(dashboard, 10, "Effective Stop", FormatPrice(tradeEffectiveStop))
+                SetDashboardStatusRow(dashboard, 11, "Last Trade", TradeOutcomeText(lastTradeOutcome), lastTradeOutcomeDashboardColor)
+                SetDashboardRow(dashboard, 12, "Last P/L / R", FormatCurrency(lastTradeProfit) + " / " + FormatRMultiple(lastTradeRMultiple))
+                SetDashboardRow(dashboard, 13, "Executed Trades", str.tostring(dailyExecutedTradeCount) + " day / " + str.tostring(totalExecutedTradeCount) + " total")
+            else
+                SetDashboardSection(dashboard, 1, "SYSTEM")
+                SetDashboardRow(dashboard, 2, "Symbol / Timeframe", syminfo.ticker + " / " + timeframe.period)
+                SetDashboardStatusRow(dashboard, 3, "Session Status", sessionState.isActive ? "ACTIVE" : "INACTIVE", sessionState.isActive ? color.lime : color.silver)
+                SetDashboardStatusRow(dashboard, 4, "Risk Engine", riskEngineEnabled ? "ON" : "OFF", riskEngineEnabled ? color.lime : color.silver)
+                SetDashboardStatusRow(dashboard, 5, "Trade Execution", tradeExecutionEnabled ? "ON" : "OFF", tradeExecutionEnabled ? color.lime : color.silver)
+                SetDashboardRow(dashboard, 6, "Bar Confirmation", barstate.isconfirmed ? "CONFIRMED" : "FORMING")
+                SetDashboardSection(dashboard, 7, "SESSION")
+                SetDashboardRow(dashboard, 8, "Session / Range", SessionText(sessionState.currentSession) + " / " + (rangeState.isComplete ? "COMPLETE" : rangeState.isBuilding ? "BUILDING" : "WAITING"))
+                SetDashboardRow(dashboard, 9, "OR High / Low", FormatPrice(rangeState.high) + " / " + FormatPrice(rangeState.low))
+                SetDashboardStatusRow(dashboard, 10, "OR Width / ATR", FormatPrice(rangeState.width) + " / " + FormatAtrMultiple(rangeState.atrRatio), rangeState.qualityAccepted ? color.lime : color.orange)
+                SetDashboardRow(dashboard, 11, "Progress / Bars", FormatPercent(sessionState.progressPercent) + " / " + str.tostring(sessionState.barsInSession))
+                SetDashboardSection(dashboard, 12, "TREND")
+                SetDashboardStatusRow(dashboard, 13, "Local Trend", TrendDirectionText(GetTrendDirection()) + " / " + FormatScore(GetTrendScore()), TrendDirectionColor(GetTrendDirection()))
+                SetDashboardRow(dashboard, 14, "HTF / Structure", (trendState.htfFastEma > trendState.htfSlowEma ? "Bullish" : trendState.htfFastEma < trendState.htfSlowEma ? "Bearish" : "Neutral") + " / " + MarketStructureText(GetMarketStructure()))
+                SetDashboardRow(dashboard, 15, "VWAP / ADX", (close > trendState.vwapValue ? "Above" : close < trendState.vwapValue ? "Below" : "At") + " / " + FormatScore(trendState.adx))
+                SetDashboardSection(dashboard, 16, "BREAKOUT")
+                SetDashboardStatusRow(dashboard, 17, "State / Direction", StateText(breakoutState) + " / " + BreakoutDirectionText(breakoutTradeDirection), TradeDirectionColor(breakoutTradeDirection))
+                SetDashboardStatusRow(dashboard, 18, "Score / Strength", FormatScore(breakoutScore) + " / " + BreakoutStrengthText(breakoutStrength), ScoreColor(breakoutScore))
+                SetDashboardRow(dashboard, 19, "Distance / Result", FormatAtrMultiple(breakoutDistanceATR) + " / " + (breakoutConfirmed ? "CONFIRMED" : breakoutFailed ? "FAILED" : "WAITING"))
+                SetDashboardSection(dashboard, 20, "RETEST")
+                SetDashboardStatusRow(dashboard, 21, "State / Direction", RetestStateText(retestState) + " / " + RetestDirectionText(retestTradeDirection), TradeDirectionColor(retestTradeDirection))
+                SetDashboardRow(dashboard, 22, "Score / Attempts", FormatScore(retestScore) + " / " + str.tostring(retestAttemptCount))
+                SetDashboardRow(dashboard, 23, "Distance / Penetration", FormatAtrMultiple(retestDistanceATR) + " / " + FormatAtrMultiple(retestPenetrationATR))
+                SetDashboardSection(dashboard, 24, "SMART MONEY")
+                SetDashboardStatusRow(dashboard, 25, "Bias / Strength", smartMoneyBiasDashboardText + " / " + smartMoneyStrengthDashboardText, smartMoneyBiasDashboardColor)
+                SetDashboardRow(dashboard, 26, "Bull / Bear Score", FormatScore(bullishSmartMoneyScore) + " / " + FormatScore(bearishSmartMoneyScore))
+                SetDashboardRow(dashboard, 27, "Sweep / PD", LiquiditySourceText(sweepSource) + " / " + PremiumDiscountText(premiumDiscountState))
+                SetDashboardSection(dashboard, 28, "TRADE SCORE")
+                SetDashboardStatusRow(dashboard, 29, "State / Bias", tradeSetupStateDashboardText + " / " + tradeBiasDashboardText, TradeBiasColor(tradeBias))
+                SetDashboardStatusRow(dashboard, 30, "Setup Score", FormatScore(tradeSetupScore), ScoreColor(tradeSetupScore))
+                SetDashboardRow(dashboard, 31, "Qualification", (bullishTradeQualified or bearishTradeQualified) ? "QUALIFIED" : "NOT QUALIFIED")
+                SetDashboardSection(dashboard, 32, "RISK")
+                SetDashboardStatusRow(dashboard, 33, "Context / Direction", riskContextActive ? "ACTIVE / " + riskDirectionDashboardText : "INACTIVE", riskContextActive ? TradeBiasColor(riskDirection) : color.silver)
+                SetDashboardRow(dashboard, 34, "Entry / Stop", FormatPrice(riskEntryPrice) + " / " + FormatPrice(riskStopPrice))
+                SetDashboardRow(dashboard, 35, "Risk / Quantity", FormatAtrMultiple(riskDistanceATR) + " / " + FormatQuantity(riskQuantity))
+                SetDashboardRow(dashboard, 36, "TP1 / TP2", FormatPrice(riskTP1) + " / " + FormatPrice(riskTP2))
+                SetDashboardStatusRow(dashboard, 37, "Guard / Approval", (riskGuardPass ? "PASS" : "BLOCKED") + " / " + (riskApproved ? "APPROVED" : "PENDING"), riskGuardPass and riskApproved ? color.lime : riskGuardPass ? color.orange : color.red)
+                SetDashboardSection(dashboard, 38, "ACTIVE TRADE")
+                SetDashboardStatusRow(dashboard, 39, "Status / Direction", (tradeActive ? "ACTIVE" : "FLAT") + " / " + TradeBiasText(activeTradeDirection), tradeActive ? TradeBiasColor(activeTradeDirection) : color.silver)
+                SetDashboardRow(dashboard, 40, "Entry / Effective Stop", FormatPrice(not na(tradeActualEntry) ? tradeActualEntry : tradePlannedEntry) + " / " + FormatPrice(tradeEffectiveStop))
+                SetDashboardRow(dashboard, 41, "TP1 / TP2", FormatPrice(tradeTP1) + " / " + FormatPrice(tradeTP2))
+                SetDashboardRow(dashboard, 42, "BE / Trail / Qty", (breakevenActivated ? "ON" : "OFF") + " / " + (trailingActivated ? "ON" : "OFF") + " / " + FormatQuantity(tradeRemainingQuantity))
+                SetDashboardSection(dashboard, 43, "PERFORMANCE")
+                SetDashboardStatusRow(dashboard, 44, "Last Outcome", TradeOutcomeText(lastTradeOutcome) + " / " + TradeExitReasonText(lastTradeExitReason), lastTradeOutcomeDashboardColor)
+                SetDashboardRow(dashboard, 45, "Last P/L / R", FormatCurrency(lastTradeProfit) + " / " + FormatRMultiple(lastTradeRMultiple))
+                SetDashboardRow(dashboard, 46, "Executed Trades", str.tostring(dailyExecutedTradeCount) + " day / " + str.tostring(sessionExecutedTradeCount) + " session / " + str.tostring(totalExecutedTradeCount) + " total")
+                SetDashboardRow(dashboard, 47, "Consecutive Losses", str.tostring(consecutiveLossCount))
+                if dashboardDetailLevel == DashboardDetailLevel.Detailed
+                    SetDashboardRow(dashboard, 48, "Retest Result", (retestConfirmed ? "CONFIRMED" : retestFailed ? "FAILED" : "WAITING") + " / " + FormatPrice(retestLevel))
+                    SetDashboardRow(dashboard, 49, "SMC FVG / OB", (latestBullishFvgActive ? "Bull FVG" : latestBearishFvgActive ? "Bear FVG" : "-") + " / " + (latestBullishObActive ? "Bull OB" : latestBearishObActive ? "Bear OB" : "-"))
+                    SetDashboardRow(dashboard, 50, "Equal High / Low", (equalHighActive ? "ACTIVE" : "-") + " / " + (equalLowActive ? "ACTIVE" : "-"))
+                    SetDashboardRow(dashboard, 51, "PDH/PDL", priceAbovePDH ? "ABOVE PDH" : priceBelowPDL ? "BELOW PDL" : "BETWEEN")
+                    SetDashboardRow(dashboard, 52, "PWH/PWL", priceAbovePWH ? "ABOVE PWH" : priceBelowPWL ? "BELOW PWL" : "BETWEEN")
+                    SetDashboardRow(dashboard, 53, "Raw Bull / Bear", FormatScore(bullishTradeScoreRawDisplay) + " / " + FormatScore(bearishTradeScoreRawDisplay))
+                    SetDashboardRow(dashboard, 54, "Adjusted Bull / Bear", FormatScore(bullishTradeScore) + " / " + FormatScore(bearishTradeScore))
+                    SetDashboardRow(dashboard, 55, "Risk Cash / Actual %", FormatCurrency(riskCashAmount) + " / " + FormatPercent(riskActualPercent))
+                    SetDashboardRow(dashboard, 56, "RR1 / RR2", FormatRMultiple(riskRR1) + " / " + FormatRMultiple(riskRR2))
+                    SetDashboardRow(dashboard, 57, "Daily Risk / P&L", FormatPercent(dailyAllocatedRiskPercent) + " / " + FormatPercent(dailyPnLPercent))
+                    SetDashboardRow(dashboard, 58, "Session Risk / P&L", FormatPercent(sessionAllocatedRiskPercent) + " / " + FormatCurrency(sessionRealizedTradeProfit))
+                    SetDashboardRow(dashboard, 59, "Daily Realized P/L", FormatCurrency(dailyRealizedTradeProfit))
+                    SetDashboardRow(dashboard, 60, "Initial / Stop Mode", FormatPrice(tradeInitialStop) + " / " + ActiveStopModeText(activeStopMode))
+                    SetDashboardRow(dashboard, 61, "TP1 / TP2 Hit", (tradeTP1Hit ? "YES" : "NO") + " / " + (tradeTP2Hit ? "YES" : "NO"))
+                    SetDashboardRow(dashboard, 62, "Strategy Net P/L", FormatCurrency(strategy.netprofit))
+                    SetDashboardRow(dashboard, 63, "Gross Profit / Loss", FormatCurrency(strategy.grossprofit) + " / " + FormatCurrency(strategy.grossloss))
+                    SetDashboardRow(dashboard, 64, "Wins / Losses", str.tostring(strategy.wintrades) + " / " + str.tostring(strategy.losstrades))
+                    SetDashboardRow(dashboard, 65, "Closed Trades", str.tostring(strategy.closedtrades))
+                    SetDashboardRow(dashboard, 66, "Win Rate", strategy.closedtrades > 0 ? FormatPercent(strategy.wintrades * 100.0 / strategy.closedtrades) : "-")
+                    SetDashboardRow(dashboard, 67, "Profit Factor", strategy.grossloss != 0.0 ? FormatValueOrDash(strategy.grossprofit / math.abs(strategy.grossloss)) : "-")
+                    SetDashboardRow(dashboard, 68, "Average Trade", strategy.closedtrades > 0 ? FormatCurrency(strategy.netprofit / strategy.closedtrades) : "-")
+                    SetDashboardRow(dashboard, 69, "Mandatory Gates", (bullishMandatoryGateDisplay ? "BULL PASS" : "BULL FAIL") + " / " + (bearishMandatoryGateDisplay ? "BEAR PASS" : "BEAR FAIL"))
+                    SetDashboardRow(dashboard, 70, "Bull / Bear Penalty", FormatScore(bullishTradePenaltyDisplay) + " / " + FormatScore(bearishTradePenaltyDisplay))
         else
-            table.clear(dashboard, 0, 0, 1, 115)
+            table.clear(dashboard, 0, 0, 1, 95)
 
 // Updates the diagnostic panel only on the last chart bar when debugging is enabled.
 UpdateDebugPanel() =>
@@ -3109,6 +3173,8 @@ riskBlockReasonDashboardText := riskBlockReason == RiskBlockReason.DailyRisk ? "
 // from coercing series enum values to const parameters through UpdateDashboard.
 smartMoneyBiasDashboardText := smartMoneyBias == SmartMoneyBias.Bullish ? "Bullish" : smartMoneyBias == SmartMoneyBias.Bearish ? "Bearish" : "Neutral"
 smartMoneyStrengthDashboardText := smartMoneyStrength == SmartMoneyStrength.Extreme ? "Extreme" : smartMoneyStrength == SmartMoneyStrength.Strong ? "Strong" : smartMoneyStrength == SmartMoneyStrength.Normal ? "Normal" : "Weak"
+smartMoneyBiasDashboardColor := smartMoneyBias == SmartMoneyBias.Bullish ? color.lime : smartMoneyBias == SmartMoneyBias.Bearish ? color.red : color.silver
+lastTradeOutcomeDashboardColor := lastTradeOutcome == TradeOutcome.Win ? color.lime : lastTradeOutcome == TradeOutcome.Loss ? color.red : color.silver
 tradeSetupStateDashboardText := tradeSetupState == TradeSetupState.BullishQualified ? "Bullish Qualified" : tradeSetupState == TradeSetupState.BearishQualified ? "Bearish Qualified" : tradeSetupState == TradeSetupState.Conflict ? "Conflict" : tradeSetupState == TradeSetupState.Disqualified ? "Disqualified" : tradeSetupState == TradeSetupState.Expired ? "Expired" : "None"
 tradeBiasDashboardText := tradeBias == TradeBias.Bullish ? "Bullish" : tradeBias == TradeBias.Bearish ? "Bearish" : tradeBias == TradeBias.Neutral ? "Neutral" : "None"
 tradeSetupStrengthDashboardText := tradeSetupStrength == TradeSetupStrength.Extreme ? "Extreme" : tradeSetupStrength == TradeSetupStrength.Strong ? "Strong" : tradeSetupStrength == TradeSetupStrength.Normal ? "Normal" : "Weak"
@@ -3140,51 +3206,73 @@ UpdateRangeDrawings()
 UpdateDashboard()
 UpdateDebugPanel()
 
-plot(showEmaPlots ? fastEmaValue : na, "Fast EMA", color = color.teal, linewidth = 2)
-plot(showEmaPlots ? slowEmaValue : na, "Slow EMA", color = color.orange, linewidth = 2)
+plot(showChartVisuals and showEmaPlots ? fastEmaValue : na, "Fast EMA", color = color.teal, linewidth = 2)
+plot(showChartVisuals and showEmaPlots ? slowEmaValue : na, "Slow EMA", color = color.orange, linewidth = 2)
 color trendBackground = IsBullTrend() ? color.new(color.lime, 90) : IsBearTrend() ? color.new(color.red, 90) : color.new(color.gray, 95)
-bgcolor(showTrendBackground ? trendBackground : na, title = "Trend Background")
 color tradeBiasBackground = tradeSetupState == TradeSetupState.BullishQualified ? color.new(color.lime, 93) : tradeSetupState == TradeSetupState.BearishQualified ? color.new(color.red, 93) : tradeSetupState == TradeSetupState.Conflict ? color.new(color.orange, 94) : na
-bgcolor(showTradeBiasBackground ? tradeBiasBackground : na, title = "Trade Bias Background")
-plot(showBreakoutLevels and (breakoutConfirmed or breakoutFailed) ? breakoutPrice : na, "Breakout Level", color = breakoutTradeDirection == TradeDirection.Long ? color.lime : breakoutTradeDirection == TradeDirection.Short ? color.red : color.gray, linewidth = 2, style = plot.style_linebr)
-plotshape(showBreakoutMarkers and bullishBreakoutSignal, "Bullish Breakout", shape.triangleup, location.belowbar, color.lime, size = size.small)
-plotshape(showBreakoutMarkers and bearishBreakoutSignal, "Bearish Breakout", shape.triangledown, location.abovebar, color.red, size = size.small)
-plotshape(showBreakoutMarkers and bullishBreakoutFailure, "Bullish Breakout Failure", shape.xcross, location.abovebar, color.orange, size = size.tiny)
-plotshape(showBreakoutMarkers and bearishBreakoutFailure, "Bearish Breakout Failure", shape.xcross, location.belowbar, color.orange, size = size.tiny)
+color activeTradeBackground = tradeActive ? activeTradeDirection == TradeBias.Bullish ? color.new(color.lime, 92) : activeTradeDirection == TradeBias.Bearish ? color.new(color.red, 92) : na : na
+color visualBackground = not na(activeTradeBackground) ? activeTradeBackground : showTradeBiasBackground ? tradeBiasBackground : showTrendBackground ? trendBackground : na
+bgcolor(showChartVisuals ? visualBackground : na, title = "M10 Context Background")
+plot(showChartVisuals and showBreakoutLevels and (breakoutConfirmed or breakoutFailed) ? breakoutPrice : na, "Breakout Level", color = breakoutTradeDirection == TradeDirection.Long ? color.lime : breakoutTradeDirection == TradeDirection.Short ? color.red : color.gray, linewidth = 2, style = plot.style_linebr)
+plotshape(showChartVisuals and showSignalMarkers and showBreakoutMarkers and bullishBreakoutSignal, "Bullish Breakout", shape.triangleup, location.belowbar, color.lime, size = size.small)
+plotshape(showChartVisuals and showSignalMarkers and showBreakoutMarkers and bearishBreakoutSignal, "Bearish Breakout", shape.triangledown, location.abovebar, color.red, size = size.small)
+plotshape(showChartVisuals and showSignalMarkers and showBreakoutMarkers and bullishBreakoutFailure, "Bullish Breakout Failure", shape.xcross, location.abovebar, color.orange, size = size.tiny)
+plotshape(showChartVisuals and showSignalMarkers and showBreakoutMarkers and bearishBreakoutFailure, "Bearish Breakout Failure", shape.xcross, location.belowbar, color.orange, size = size.tiny)
 plotchar(showBreakoutScore and (bullishBreakoutSignal or bearishBreakoutSignal) ? breakoutScore : na, "Breakout Score", "•", location.top, color = color.white)
 bool retestLevelVisible = retestState != RetestState.None and not na(retestLevel)
-plot(showRetestLevel and retestLevelVisible ? retestLevel : na, "Retest Level", color = retestTradeDirection == TradeDirection.Long ? color.aqua : retestTradeDirection == TradeDirection.Short ? color.fuchsia : color.gray, linewidth = 2, style = plot.style_linebr)
-plotshape(showRetestMarkers and bullishRetestDetected, "Bullish Retest Detected", shape.circle, location.belowbar, color.aqua, size = size.tiny)
-plotshape(showRetestMarkers and bearishRetestDetected, "Bearish Retest Detected", shape.circle, location.abovebar, color.fuchsia, size = size.tiny)
-plotshape(showRetestMarkers and bullishRetestConfirmed, "Bullish Retest Confirmed", shape.diamond, location.belowbar, color.lime, size = size.small)
-plotshape(showRetestMarkers and bearishRetestConfirmed, "Bearish Retest Confirmed", shape.diamond, location.abovebar, color.red, size = size.small)
-plotshape(showRetestMarkers and bullishRetestFailure, "Bullish Retest Failure", shape.xcross, location.abovebar, color.orange, size = size.small)
-plotshape(showRetestMarkers and bearishRetestFailure, "Bearish Retest Failure", shape.xcross, location.belowbar, color.orange, size = size.small)
+plot(showChartVisuals and showRetestLevel and retestLevelVisible ? retestLevel : na, "Retest Level", color = retestTradeDirection == TradeDirection.Long ? color.aqua : retestTradeDirection == TradeDirection.Short ? color.fuchsia : color.gray, linewidth = 2, style = plot.style_linebr)
+plotshape(showChartVisuals and showSignalMarkers and showRetestMarkers and bullishRetestDetected, "Bullish Retest Detected", shape.circle, location.belowbar, color.aqua, size = size.tiny)
+plotshape(showChartVisuals and showSignalMarkers and showRetestMarkers and bearishRetestDetected, "Bearish Retest Detected", shape.circle, location.abovebar, color.fuchsia, size = size.tiny)
+plotshape(showChartVisuals and showSignalMarkers and showRetestMarkers and bullishRetestConfirmed, "Bullish Retest Confirmed", shape.diamond, location.belowbar, color.lime, size = size.small)
+plotshape(showChartVisuals and showSignalMarkers and showRetestMarkers and bearishRetestConfirmed, "Bearish Retest Confirmed", shape.diamond, location.abovebar, color.red, size = size.small)
+plotshape(showChartVisuals and showSignalMarkers and showRetestMarkers and bullishRetestFailure, "Bullish Retest Failure", shape.xcross, location.abovebar, color.orange, size = size.small)
+plotshape(showChartVisuals and showSignalMarkers and showRetestMarkers and bearishRetestFailure, "Bearish Retest Failure", shape.xcross, location.belowbar, color.orange, size = size.small)
 plotchar(showRetestScore and (bullishRetestConfirmed or bearishRetestConfirmed) ? retestScore : na, "Retest Score", "R", location.bottom, color = color.white)
-plotshape(showQualifiedSetupMarkers and bullishTradeQualifiedEvent, "Bullish Qualified Setup", shape.labelup, location.belowbar, color.lime, text = "LONG", textcolor = color.white, size = size.small)
-plotshape(showQualifiedSetupMarkers and bearishTradeQualifiedEvent, "Bearish Qualified Setup", shape.labeldown, location.abovebar, color.red, text = "SHORT", textcolor = color.white, size = size.small)
-if showSetupScore and bullishTradeQualifiedEvent
+plotshape(showChartVisuals and showSignalMarkers and showQualifiedSetupMarkers and bullishTradeQualifiedEvent, "Bullish Qualified Setup", shape.labelup, location.belowbar, color.lime, text = "LONG", textcolor = color.white, size = size.small)
+plotshape(showChartVisuals and showSignalMarkers and showQualifiedSetupMarkers and bearishTradeQualifiedEvent, "Bearish Qualified Setup", shape.labeldown, location.abovebar, color.red, text = "SHORT", textcolor = color.white, size = size.small)
+if showChartVisuals and showSignalMarkers and showSetupScore and bullishTradeQualifiedEvent
     label.new(bar_index, low, "LONG " + FormatValueOrDash(tradeSetupScore), style = label.style_label_up, color = color.lime, textcolor = color.white, size = size.tiny)
-if showSetupScore and bearishTradeQualifiedEvent
+if showChartVisuals and showSignalMarkers and showSetupScore and bearishTradeQualifiedEvent
     label.new(bar_index, high, "SHORT " + FormatValueOrDash(tradeSetupScore), style = label.style_label_down, color = color.red, textcolor = color.white, size = size.tiny)
-plot(showPreviousDayLevels ? previousDayHigh : na, "Previous Day High", color = color.new(color.blue, 20), linewidth = 1, style = plot.style_linebr)
-plot(showPreviousDayLevels ? previousDayLow : na, "Previous Day Low", color = color.new(color.blue, 20), linewidth = 1, style = plot.style_linebr)
-plot(showPreviousDayLevels ? previousDayClose : na, "Previous Day Close", color = color.new(color.blue, 55), linewidth = 1, style = plot.style_linebr)
-plot(showPreviousDayLevels ? previousDayMid : na, "Previous Day Mid", color = color.new(color.blue, 70), linewidth = 1, style = plot.style_linebr)
-plot(showPreviousWeekLevels ? previousWeekHigh : na, "Previous Week High", color = color.new(color.purple, 20), linewidth = 1, style = plot.style_linebr)
-plot(showPreviousWeekLevels ? previousWeekLow : na, "Previous Week Low", color = color.new(color.purple, 20), linewidth = 1, style = plot.style_linebr)
-plot(showPreviousWeekLevels ? previousWeekClose : na, "Previous Week Close", color = color.new(color.purple, 55), linewidth = 1, style = plot.style_linebr)
-plot(showPreviousWeekLevels ? previousWeekMid : na, "Previous Week Mid", color = color.new(color.purple, 70), linewidth = 1, style = plot.style_linebr)
-plot(showEqualHighsLows and equalHighActive ? equalHighLevel : na, "Equal Highs", color = color.orange, linewidth = 2, style = plot.style_linebr)
-plot(showEqualHighsLows and equalLowActive ? equalLowLevel : na, "Equal Lows", color = color.aqua, linewidth = 2, style = plot.style_linebr)
-plotshape(showLiquiditySweeps and bullishLiquiditySweep, "Bullish Liquidity Sweep", shape.triangleup, location.belowbar, color.lime, size = size.small)
-plotshape(showLiquiditySweeps and bearishLiquiditySweep, "Bearish Liquidity Sweep", shape.triangledown, location.abovebar, color.red, size = size.small)
-plot(showFvgZones and latestBullishFvgActive ? latestBullishFvgTop : na, "Bullish FVG Top", color = color.new(color.lime, 35), style = plot.style_linebr)
-plot(showFvgZones and latestBullishFvgActive ? latestBullishFvgBottom : na, "Bullish FVG Bottom", color = color.new(color.lime, 35), style = plot.style_linebr)
-plot(showFvgZones and latestBearishFvgActive ? latestBearishFvgTop : na, "Bearish FVG Top", color = color.new(color.red, 35), style = plot.style_linebr)
-plot(showFvgZones and latestBearishFvgActive ? latestBearishFvgBottom : na, "Bearish FVG Bottom", color = color.new(color.red, 35), style = plot.style_linebr)
-plot(showOrderBlocks and latestBullishObActive ? latestBullishObMid : na, "Bullish OB Mid", color = color.new(color.aqua, 20), linewidth = 2, style = plot.style_linebr)
-plot(showOrderBlocks and latestBearishObActive ? latestBearishObMid : na, "Bearish OB Mid", color = color.new(color.orange, 20), linewidth = 2, style = plot.style_linebr)
-plot(showPremiumDiscount ? dealingRangeHigh : na, "Dealing Range High", color = color.new(color.purple, 35), style = plot.style_linebr)
-plot(showPremiumDiscount ? dealingRangeLow : na, "Dealing Range Low", color = color.new(color.purple, 35), style = plot.style_linebr)
-plot(showPremiumDiscount ? dealingRangeEquilibrium : na, "Dealing Range Equilibrium", color = color.new(color.gray, 30), style = plot.style_linebr)
+plot(showChartVisuals and showSmartMoneyVisuals and showPreviousDayLevels ? previousDayHigh : na, "Previous Day High", color = color.new(color.blue, 20), linewidth = 1, style = plot.style_linebr)
+plot(showChartVisuals and showSmartMoneyVisuals and showPreviousDayLevels ? previousDayLow : na, "Previous Day Low", color = color.new(color.blue, 20), linewidth = 1, style = plot.style_linebr)
+plot(showChartVisuals and showSmartMoneyVisuals and showPreviousDayLevels ? previousDayClose : na, "Previous Day Close", color = color.new(color.blue, 55), linewidth = 1, style = plot.style_linebr)
+plot(showChartVisuals and showSmartMoneyVisuals and showPreviousDayLevels ? previousDayMid : na, "Previous Day Mid", color = color.new(color.blue, 70), linewidth = 1, style = plot.style_linebr)
+plot(showChartVisuals and showSmartMoneyVisuals and showPreviousWeekLevels ? previousWeekHigh : na, "Previous Week High", color = color.new(color.purple, 20), linewidth = 1, style = plot.style_linebr)
+plot(showChartVisuals and showSmartMoneyVisuals and showPreviousWeekLevels ? previousWeekLow : na, "Previous Week Low", color = color.new(color.purple, 20), linewidth = 1, style = plot.style_linebr)
+plot(showChartVisuals and showSmartMoneyVisuals and showPreviousWeekLevels ? previousWeekClose : na, "Previous Week Close", color = color.new(color.purple, 55), linewidth = 1, style = plot.style_linebr)
+plot(showChartVisuals and showSmartMoneyVisuals and showPreviousWeekLevels ? previousWeekMid : na, "Previous Week Mid", color = color.new(color.purple, 70), linewidth = 1, style = plot.style_linebr)
+plot(showChartVisuals and showSmartMoneyVisuals and showEqualHighsLows and equalHighActive ? equalHighLevel : na, "Equal Highs", color = color.orange, linewidth = 2, style = plot.style_linebr)
+plot(showChartVisuals and showSmartMoneyVisuals and showEqualHighsLows and equalLowActive ? equalLowLevel : na, "Equal Lows", color = color.aqua, linewidth = 2, style = plot.style_linebr)
+plotshape(showChartVisuals and showSmartMoneyVisuals and showSignalMarkers and showLiquiditySweeps and bullishLiquiditySweep, "Bullish Liquidity Sweep", shape.triangleup, location.belowbar, color.lime, size = size.small)
+plotshape(showChartVisuals and showSmartMoneyVisuals and showSignalMarkers and showLiquiditySweeps and bearishLiquiditySweep, "Bearish Liquidity Sweep", shape.triangledown, location.abovebar, color.red, size = size.small)
+plot(showChartVisuals and showSmartMoneyVisuals and showFvgZones and latestBullishFvgActive ? latestBullishFvgTop : na, "Bullish FVG Top", color = color.new(color.lime, 35), style = plot.style_linebr)
+plot(showChartVisuals and showSmartMoneyVisuals and showFvgZones and latestBullishFvgActive ? latestBullishFvgBottom : na, "Bullish FVG Bottom", color = color.new(color.lime, 35), style = plot.style_linebr)
+plot(showChartVisuals and showSmartMoneyVisuals and showFvgZones and latestBearishFvgActive ? latestBearishFvgTop : na, "Bearish FVG Top", color = color.new(color.red, 35), style = plot.style_linebr)
+plot(showChartVisuals and showSmartMoneyVisuals and showFvgZones and latestBearishFvgActive ? latestBearishFvgBottom : na, "Bearish FVG Bottom", color = color.new(color.red, 35), style = plot.style_linebr)
+plot(showChartVisuals and showSmartMoneyVisuals and showOrderBlocks and latestBullishObActive ? latestBullishObMid : na, "Bullish OB Mid", color = color.new(color.aqua, 20), linewidth = 2, style = plot.style_linebr)
+plot(showChartVisuals and showSmartMoneyVisuals and showOrderBlocks and latestBearishObActive ? latestBearishObMid : na, "Bearish OB Mid", color = color.new(color.orange, 20), linewidth = 2, style = plot.style_linebr)
+plot(showChartVisuals and showSmartMoneyVisuals and showPremiumDiscount ? dealingRangeHigh : na, "Dealing Range High", color = color.new(color.purple, 35), style = plot.style_linebr)
+plot(showChartVisuals and showSmartMoneyVisuals and showPremiumDiscount ? dealingRangeLow : na, "Dealing Range Low", color = color.new(color.purple, 35), style = plot.style_linebr)
+plot(showChartVisuals and showSmartMoneyVisuals and showPremiumDiscount ? dealingRangeEquilibrium : na, "Dealing Range Equilibrium", color = color.new(color.gray, 30), style = plot.style_linebr)
+
+// M10 consumes only M8/M9 outputs for trade-level presentation. Conditional
+// plot series avoid creating drawing objects and disappear when the trade ends.
+float displayedTradeEntry = tradeActive ? not na(tradeActualEntry) ? tradeActualEntry : tradePlannedEntry : na
+plot(showChartVisuals and showTradeLevels ? displayedTradeEntry : na, "Active Trade Entry", color = color.new(color.blue, 0), linewidth = 2, style = plot.style_linebr)
+plot(showChartVisuals and showTradeLevels and tradeActive ? tradeEffectiveStop : na, "Effective Trade Stop", color = color.new(color.red, 0), linewidth = 2, style = plot.style_linebr)
+plot(showChartVisuals and showTradeLevels and tradeActive and not tradeTP1Hit ? tradeTP1 : na, "Active Trade TP1", color = color.new(color.lime, 25), linewidth = 1, style = plot.style_linebr)
+plot(showChartVisuals and showTradeLevels and tradeActive ? tradeTP2 : na, "Active Trade TP2", color = color.new(color.lime, 0), linewidth = 1, style = plot.style_linebr)
+
+// M10 markers use one-bar M7-M9 events only; persistent state never produces
+// repeated chart labels.
+plotshape(showChartVisuals and showSignalMarkers and bullishRiskApprovedEvent, "Bullish Risk Approved", shape.circle, location.belowbar, color.aqua, text = "RISK", textcolor = color.black, size = size.tiny)
+plotshape(showChartVisuals and showSignalMarkers and bearishRiskApprovedEvent, "Bearish Risk Approved", shape.circle, location.abovebar, color.fuchsia, text = "RISK", textcolor = color.white, size = size.tiny)
+plotshape(showChartVisuals and showSignalMarkers and longPositionOpened, "Long Entry", shape.labelup, location.belowbar, color.lime, text = "ENTRY", textcolor = color.white, size = size.tiny)
+plotshape(showChartVisuals and showSignalMarkers and shortPositionOpened, "Short Entry", shape.labeldown, location.abovebar, color.red, text = "ENTRY", textcolor = color.white, size = size.tiny)
+plotshape(showChartVisuals and showSignalMarkers and tradeTP1HitEvent, "TP1 Filled", shape.labeldown, location.abovebar, color.teal, text = "TP1", textcolor = color.white, size = size.tiny)
+plotshape(showChartVisuals and showSignalMarkers and breakevenActivatedEvent, "Breakeven Activated", shape.labelup, location.belowbar, color.aqua, text = "BE", textcolor = color.black, size = size.tiny)
+plotshape(showChartVisuals and showSignalMarkers and trailingActivatedEvent, "Trailing Activated", shape.labelup, location.belowbar, color.orange, text = "TRAIL", textcolor = color.white, size = size.tiny)
+plotshape(showChartVisuals and showSignalMarkers and tradeWinEvent, "Trade Win", shape.labelup, location.belowbar, color.lime, text = "WIN", textcolor = color.white, size = size.tiny)
+plotshape(showChartVisuals and showSignalMarkers and tradeLossEvent, "Trade Loss", shape.labeldown, location.abovebar, color.red, text = "LOSS", textcolor = color.white, size = size.tiny)
+plotshape(showChartVisuals and showSignalMarkers and tradeBreakevenEvent, "Trade Breakeven", shape.labeldown, location.abovebar, color.silver, text = "BE", textcolor = color.black, size = size.tiny)
