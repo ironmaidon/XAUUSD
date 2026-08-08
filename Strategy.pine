@@ -315,169 +315,142 @@ GetMarketStructure() =>
 var float priorSwingHigh = na
 var float priorSwingLow = na
 
-// Updates swing prices and structure only after a pivot is confirmed.
-UpdateMarketStructure(float pivotHigh, float pivotLow) =>
-    trendState.structureBreak := false
+// Calculates updated swing values without mutating persistent global state.
+CalculateMarketStructure(float previousHigh, float previousLow, float currentHigh, float currentLow, MarketStructure currentStructure, float pivotHigh, float pivotLow) =>
+    float nextPreviousHigh = previousHigh
+    float nextPreviousLow = previousLow
+    float nextCurrentHigh = currentHigh
+    float nextCurrentLow = currentLow
+    MarketStructure nextStructure = currentStructure
     if not na(pivotHigh)
-        priorSwingHigh := trendState.swingHigh
-        trendState.swingHigh := pivotHigh
-        if not na(priorSwingHigh)
-            trendState.structure := pivotHigh > priorSwingHigh ? MarketStructure.HigherHigh : MarketStructure.LowerHigh
+        nextPreviousHigh := currentHigh
+        nextCurrentHigh := pivotHigh
+        if not na(nextPreviousHigh)
+            nextStructure := pivotHigh > nextPreviousHigh ? MarketStructure.HigherHigh : MarketStructure.LowerHigh
     if not na(pivotLow)
-        priorSwingLow := trendState.swingLow
-        trendState.swingLow := pivotLow
-        if not na(priorSwingLow)
-            trendState.structure := pivotLow > priorSwingLow ? MarketStructure.HigherLow : MarketStructure.LowerLow
-    bool breaksHigh = not na(priorSwingHigh) and ta.crossover(close, priorSwingHigh)
-    bool breaksLow = not na(priorSwingLow) and ta.crossunder(close, priorSwingLow)
-    trendState.structureBreak := breaksHigh or breaksLow
+        nextPreviousLow := currentLow
+        nextCurrentLow := pivotLow
+        if not na(nextPreviousLow)
+            nextStructure := pivotLow > nextPreviousLow ? MarketStructure.HigherLow : MarketStructure.LowerLow
+    bool breaksHigh = not na(nextPreviousHigh) and ta.crossover(close, nextPreviousHigh)
+    bool breaksLow = not na(nextPreviousLow) and ta.crossunder(close, nextPreviousLow)
+    [nextPreviousHigh, nextPreviousLow, nextCurrentHigh, nextCurrentLow, nextStructure, breaksHigh or breaksLow]
 
-// Derives direction, strength, and the 0-100 score from reusable trend inputs.
-UpdateTrendEngine(float fastEma, float slowEma, float htfFastEma, float htfSlowEma, float vwapValue, float adxValue, float plusDiValue, float minusDiValue, float pivotHigh, float pivotLow) =>
-    trendState.fastEma := fastEma
-    trendState.slowEma := slowEma
-    trendState.htfFastEma := htfFastEma
-    trendState.htfSlowEma := htfSlowEma
-    trendState.vwapValue := vwapValue
-    trendState.vwapDistance := close - vwapValue
-    trendState.vwapSlope := vwapValue - vwapValue[1]
-    trendState.adx := adxValue
-    trendState.plusDi := plusDiValue
-    trendState.minusDi := minusDiValue
-    trendState.isTrending := adxValue >= adxTrendThreshold
-    UpdateMarketStructure(pivotHigh, pivotLow)
-
+// Calculates the normalized trend values without mutating persistent global state.
+CalculateTrendState(float fastEma, float slowEma, float htfFastEma, float htfSlowEma, float vwapValue, float priorVwapValue, float adxValue, float plusDiValue, float minusDiValue, MarketStructure structure) =>
+    float vwapDistance = close - vwapValue
+    float vwapSlope = vwapValue - priorVwapValue
+    bool trending = adxValue >= adxTrendThreshold
     bool emaBullish = emaFilterEnabled and fastEma > slowEma
     bool emaBearish = emaFilterEnabled and fastEma < slowEma
     bool htfBullish = emaFilterEnabled and htfFastEma > htfSlowEma
     bool htfBearish = emaFilterEnabled and htfFastEma < htfSlowEma
     bool vwapBullish = vwapFilterEnabled and close > vwapValue
     bool vwapBearish = vwapFilterEnabled and close < vwapValue
-    bool structureBullish = trendState.structure == MarketStructure.HigherHigh or trendState.structure == MarketStructure.HigherLow
-    bool structureBearish = trendState.structure == MarketStructure.LowerHigh or trendState.structure == MarketStructure.LowerLow
+    bool structureBullish = structure == MarketStructure.HigherHigh or structure == MarketStructure.HigherLow
+    bool structureBearish = structure == MarketStructure.LowerHigh or structure == MarketStructure.LowerLow
 
-    float bullScore = (emaBullish ? 30.0 : 0.0) + (htfBullish ? 25.0 : 0.0) + (vwapBullish ? 15.0 : 0.0) + (trendState.isTrending and plusDiValue > minusDiValue ? 20.0 : 0.0) + (structureBullish ? 10.0 : 0.0)
-    float bearScore = (emaBearish ? 30.0 : 0.0) + (htfBearish ? 25.0 : 0.0) + (vwapBearish ? 15.0 : 0.0) + (trendState.isTrending and minusDiValue > plusDiValue ? 20.0 : 0.0) + (structureBearish ? 10.0 : 0.0)
-    trendState.score := math.max(bullScore, bearScore)
-    trendState.direction := bullScore > bearScore ? TrendDirection.Bullish : bearScore > bullScore ? TrendDirection.Bearish : TrendDirection.Neutral
-    trendState.strength := trendState.score >= 70.0 ? TrendStrength.Strong : trendState.score >= 45.0 ? TrendStrength.Moderate : TrendStrength.Weak
+    float bullScore = (emaBullish ? 30.0 : 0.0) + (htfBullish ? 25.0 : 0.0) + (vwapBullish ? 15.0 : 0.0) + (trending and plusDiValue > minusDiValue ? 20.0 : 0.0) + (structureBullish ? 10.0 : 0.0)
+    float bearScore = (emaBearish ? 30.0 : 0.0) + (htfBearish ? 25.0 : 0.0) + (vwapBearish ? 15.0 : 0.0) + (trending and minusDiValue > plusDiValue ? 20.0 : 0.0) + (structureBearish ? 10.0 : 0.0)
+    float score = math.max(bullScore, bearScore)
+    TrendDirection direction = bullScore > bearScore ? TrendDirection.Bullish : bearScore > bullScore ? TrendDirection.Bearish : TrendDirection.Neutral
+    TrendStrength strength = score >= 70.0 ? TrendStrength.Strong : score >= 45.0 ? TrendStrength.Moderate : TrendStrength.Weak
+    [direction, strength, score, vwapDistance, vwapSlope, trending]
 
 //============================================================================== 
 // 6. SESSION ENGINE
 //============================================================================== 
-// Updates session lifecycle fields once per confirmed bar.
-UpdateSessionEngine() =>
+// Calculates session lifecycle fields without mutating persistent global state.
+CalculateSessionState(SessionEngineState previousState) =>
     SessionName activeSession = CurrentSession()
     bool activeNow = activeSession != SessionName.None
-    bool sessionChanged = activeNow and activeSession != sessionState.currentSession
-    sessionState.justStarted := sessionChanged
-    sessionState.justEnded := sessionState.isActive and (not activeNow or sessionChanged)
-    if sessionChanged
-        sessionState.currentSession := activeSession
-        sessionState.startTime := time
-        sessionState.durationMinutes := SessionDurationMinutes(activeSession)
-        sessionState.barsInSession := 1
-    else if activeNow
-        sessionState.barsInSession += 1
-    else
-        sessionState.barsInSession := 0
-        sessionState.currentSession := SessionName.None
-        sessionState.durationMinutes := 0
-    sessionState.isActive := activeNow
-    float elapsedMilliseconds = activeNow ? time - sessionState.startTime : 0.0
-    float durationMilliseconds = sessionState.durationMinutes * MILLISECONDS_PER_MINUTE
-    sessionState.progressPercent := activeNow ? math.min(100.0, SafeDivide(elapsedMilliseconds * 100.0, durationMilliseconds, 0.0)) : 0.0
+    bool sessionChanged = activeNow and activeSession != previousState.currentSession
+    bool justEnded = previousState.isActive and (not activeNow or sessionChanged)
+    int startTime = sessionChanged ? time : previousState.startTime
+    int durationMinutes = activeNow ? (sessionChanged ? SessionDurationMinutes(activeSession) : previousState.durationMinutes) : 0
+    int barsInSession = sessionChanged ? 1 : activeNow ? previousState.barsInSession + 1 : 0
+    float elapsedMilliseconds = activeNow ? time - startTime : 0.0
+    float durationMilliseconds = durationMinutes * MILLISECONDS_PER_MINUTE
+    float progressPercent = activeNow ? math.min(100.0, SafeDivide(elapsedMilliseconds * 100.0, durationMilliseconds, 0.0)) : 0.0
     float barMilliseconds = timeframe.in_seconds() * 1000.0
-    sessionState.barsRemaining := activeNow ? math.max(0, int(math.ceil(SafeDivide(durationMilliseconds - elapsedMilliseconds, barMilliseconds, 0.0))) ) : 0
+    int barsRemaining = activeNow ? math.max(0, int(math.ceil(SafeDivide(durationMilliseconds - elapsedMilliseconds, barMilliseconds, 0.0)))) : 0
+    SessionEngineState.new(activeNow ? activeSession : SessionName.None, activeNow, sessionChanged, justEnded, startTime, durationMinutes, barsInSession, progressPercent, barsRemaining)
 
 //============================================================================== 
 // 7. OPENING RANGE ENGINE
 //============================================================================== 
-// Resets every range and trade-control field at the beginning of a new session.
-ResetForSession() =>
-    rangeState.high := na
-    rangeState.low := na
-    rangeState.mid := na
-    rangeState.width := na
-    rangeState.atrRatio := na
-    rangeState.percent := na
-    rangeState.ticks := na
-    rangeState.startTime := time
-    rangeState.endTime := time + OpeningRangeMinutes() * MILLISECONDS_PER_MINUTE
-    rangeState.bars := 0
-    rangeState.isBuilding := true
-    rangeState.isComplete := false
-    rangeState.qualityAccepted := false
-    tradeControl.tradeTaken := false
-    tradeControl.longTaken := false
-    tradeControl.shortTaken := false
-    tradeControl.sessionLocked := false
-    breakoutDirection := 0
-    atrAtRangeCompletion := na
-    breakoutState := BreakoutState.BuildingRange
+// Calculates the fresh session range and trade-control state.
+CreateSessionRange() =>
+    OpeningRangeState freshRange = OpeningRangeState.new(na, na, na, na, na, na, na, time, time + OpeningRangeMinutes() * MILLISECONDS_PER_MINUTE, 0, true, false, false)
+    TradeControlState freshTradeControl = TradeControlState.new(false, false, false, false)
+    [freshRange, freshTradeControl, 0, na, BreakoutState.BuildingRange]
 
-// Adds one confirmed bar to the opening range and derives its metrics.
-BuildOpeningRange(float atrValue) =>
-    bool isRangeBar = time < rangeState.endTime
-    if rangeState.isBuilding and isRangeBar
-        rangeState.high := na(rangeState.high) ? high : math.max(rangeState.high, high)
-        rangeState.low := na(rangeState.low) ? low : math.min(rangeState.low, low)
-        rangeState.bars += 1
-        rangeState.mid := (rangeState.high + rangeState.low) * 0.5
-        rangeState.width := rangeState.high - rangeState.low
-        rangeState.atrRatio := SafeDivide(rangeState.width, atrValue, na)
-        rangeState.percent := SafeDivide(rangeState.width * 100.0, rangeState.mid, na)
-        rangeState.ticks := SafeDivide(rangeState.width, syminfo.mintick, na)
-    if rangeState.isBuilding and not isRangeBar
-        rangeState.isBuilding := false
-        rangeState.isComplete := true
-        rangeState.mid := (rangeState.high + rangeState.low) * 0.5
-        rangeState.width := rangeState.high - rangeState.low
-        atrAtRangeCompletion := atrValue
-        rangeState.atrRatio := SafeDivide(rangeState.width, atrValue, na)
-        rangeState.percent := SafeDivide(rangeState.width * 100.0, rangeState.mid, na)
-        rangeState.ticks := SafeDivide(rangeState.width, syminfo.mintick, na)
-        rangeState.qualityAccepted := rangeState.atrRatio >= minimumAtrRatio and rangeState.atrRatio <= maximumAtrRatio
-        breakoutState := BreakoutState.RangeCompleted
+// Calculates the next opening-range state from one confirmed chart bar.
+CalculateOpeningRange(OpeningRangeState previousRange, float atrValue) =>
+    float nextHigh = previousRange.high
+    float nextLow = previousRange.low
+    int nextBars = previousRange.bars
+    bool nextBuilding = previousRange.isBuilding
+    bool nextComplete = previousRange.isComplete
+    bool rangeBar = time < previousRange.endTime
+    if previousRange.isBuilding and rangeBar
+        nextHigh := na(nextHigh) ? high : math.max(nextHigh, high)
+        nextLow := na(nextLow) ? low : math.min(nextLow, low)
+        nextBars += 1
+    float nextMid = not na(nextHigh) and not na(nextLow) ? (nextHigh + nextLow) * 0.5 : na
+    float nextWidth = not na(nextHigh) and not na(nextLow) ? nextHigh - nextLow : na
+    float nextAtrRatio = SafeDivide(nextWidth, atrValue, na)
+    float nextPercent = SafeDivide(nextWidth * 100.0, nextMid, na)
+    float nextTicks = SafeDivide(nextWidth, syminfo.mintick, na)
+    float nextAtrAtCompletion = na
+    BreakoutState nextBreakoutState = breakoutState
+    bool nextQualityAccepted = previousRange.qualityAccepted
+    if previousRange.isBuilding and not rangeBar
+        nextBuilding := false
+        nextComplete := true
+        nextAtrAtCompletion := atrValue
+        nextQualityAccepted := nextAtrRatio >= minimumAtrRatio and nextAtrRatio <= maximumAtrRatio
+        nextBreakoutState := BreakoutState.RangeCompleted
+    OpeningRangeState nextRange = OpeningRangeState.new(nextHigh, nextLow, nextMid, nextWidth, nextAtrRatio, nextPercent, nextTicks, previousRange.startTime, previousRange.endTime, nextBars, nextBuilding, nextComplete, nextQualityAccepted)
+    [nextRange, nextAtrAtCompletion, nextBreakoutState]
 
-// Stores a completed range in aggregate session statistics exactly once.
-RecordCompletedRange() =>
-    sessionStatistics.sessions += 1
-    sessionStatistics.totalRange += rangeState.width
-    sessionStatistics.totalAtrRatio += rangeState.atrRatio
-    sessionStatistics.largestRange := na(sessionStatistics.largestRange) ? rangeState.width : math.max(sessionStatistics.largestRange, rangeState.width)
-    sessionStatistics.smallestRange := na(sessionStatistics.smallestRange) ? rangeState.width : math.min(sessionStatistics.smallestRange, rangeState.width)
+// Calculates aggregate statistics after one completed opening range.
+CalculateCompletedRangeStatistics(SessionStatistics previousStatistics, OpeningRangeState completedRange) =>
+    SessionStatistics.new(previousStatistics.sessions + 1, previousStatistics.totalRange + completedRange.width, na(previousStatistics.largestRange) ? completedRange.width : math.max(previousStatistics.largestRange, completedRange.width), na(previousStatistics.smallestRange) ? completedRange.width : math.min(previousStatistics.smallestRange, completedRange.width), previousStatistics.totalAtrRatio + completedRange.atrRatio, previousStatistics.breakouts, previousStatistics.falseBreakouts, previousStatistics.successfulBreakouts)
 
 //============================================================================== 
 // 8. BREAKOUT STATE MACHINE
 //============================================================================== 
-// Advances the non-trading breakout state machine using only confirmed closes.
-UpdateBreakoutState() =>
-    if rangeState.isComplete and sessionState.isActive and rangeState.qualityAccepted
-        bool closesAbove = close > rangeState.high
-        bool closesBelow = close < rangeState.low
-        bool closesInside = close <= rangeState.high and close >= rangeState.low
-        if breakoutState == BreakoutState.RangeCompleted and (closesAbove or closesBelow)
-            breakoutDirection := closesAbove ? 1 : -1
-            breakoutState := BreakoutState.BreakoutPending
-        else if breakoutState == BreakoutState.BreakoutPending
-            bool confirms = breakoutDirection == 1 ? closesAbove : closesBelow
+// Calculates the next non-trading breakout state and associated statistics.
+CalculateBreakoutState(OpeningRangeState currentRange, BreakoutState currentState, int currentDirection, SessionStatistics previousStatistics) =>
+    BreakoutState nextState = currentState
+    int nextDirection = currentDirection
+    SessionStatistics nextStatistics = previousStatistics
+    if currentRange.isComplete and sessionState.isActive and currentRange.qualityAccepted
+        bool closesAbove = close > currentRange.high
+        bool closesBelow = close < currentRange.low
+        bool closesInside = close <= currentRange.high and close >= currentRange.low
+        if currentState == BreakoutState.RangeCompleted and (closesAbove or closesBelow)
+            nextDirection := closesAbove ? 1 : -1
+            nextState := BreakoutState.BreakoutPending
+        else if currentState == BreakoutState.BreakoutPending
+            bool confirms = nextDirection == 1 ? closesAbove : closesBelow
             if confirms
-                breakoutState := BreakoutState.BreakoutConfirmed
-                sessionStatistics.breakouts += 1
-                sessionStatistics.successfulBreakouts += 1
+                nextState := BreakoutState.BreakoutConfirmed
+                nextStatistics := SessionStatistics.new(previousStatistics.sessions, previousStatistics.totalRange, previousStatistics.largestRange, previousStatistics.smallestRange, previousStatistics.totalAtrRatio, previousStatistics.breakouts + 1, previousStatistics.falseBreakouts, previousStatistics.successfulBreakouts + 1)
             else if closesInside
-                breakoutState := BreakoutState.RangeCompleted
-                breakoutDirection := 0
-                sessionStatistics.falseBreakouts += 1
-        else if breakoutState == BreakoutState.BreakoutConfirmed
-            bool retestsLevel = breakoutDirection == 1 ? low <= rangeState.high : high >= rangeState.low
+                nextState := BreakoutState.RangeCompleted
+                nextDirection := 0
+                nextStatistics := SessionStatistics.new(previousStatistics.sessions, previousStatistics.totalRange, previousStatistics.largestRange, previousStatistics.smallestRange, previousStatistics.totalAtrRatio, previousStatistics.breakouts, previousStatistics.falseBreakouts + 1, previousStatistics.successfulBreakouts)
+        else if currentState == BreakoutState.BreakoutConfirmed
+            bool retestsLevel = nextDirection == 1 ? low <= currentRange.high : high >= currentRange.low
             if retestsLevel
-                breakoutState := BreakoutState.RetestPending
-        else if breakoutState == BreakoutState.RetestPending
-            bool resumesBreakout = breakoutDirection == 1 ? close > rangeState.high : close < rangeState.low
+                nextState := BreakoutState.RetestPending
+        else if currentState == BreakoutState.RetestPending
+            bool resumesBreakout = nextDirection == 1 ? close > currentRange.high : close < currentRange.low
             if resumesBreakout
-                breakoutState := BreakoutState.BreakoutConfirmed
+                nextState := BreakoutState.BreakoutConfirmed
+    [nextDirection, nextState, nextStatistics]
 
 //============================================================================== 
 // 9. DRAWING MANAGER
@@ -490,20 +463,19 @@ var label rangeHighLabel = na
 var label rangeLowLabel = na
 var label rangeWidthLabel = na
 
-// Creates the fixed set of drawing objects once, then updates them in place.
-EnsureDrawings() =>
-    if na(rangeBox)
-        rangeBox := box.new(bar_index, close, bar_index, close, border_color = rangeColor, bgcolor = color.new(rangeColor, rangeTransparency))
-        rangeHighLine := line.new(bar_index, close, bar_index, close, color = rangeColor)
-        rangeLowLine := line.new(bar_index, close, bar_index, close, color = rangeColor)
-        rangeMidLine := line.new(bar_index, close, bar_index, close, color = color.new(rangeColor, 30), style = line.style_dashed)
-        rangeHighLabel := label.new(bar_index, close, "", style = label.style_label_left, color = color.new(rangeColor, 80), textcolor = color.white, size = size.tiny)
-        rangeLowLabel := label.new(bar_index, close, "", style = label.style_label_left, color = color.new(rangeColor, 80), textcolor = color.white, size = size.tiny)
-        rangeWidthLabel := label.new(bar_index, close, "", style = label.style_label_left, color = color.new(rangeColor, 80), textcolor = color.white, size = size.tiny)
+// Creates drawing references for assignment from the main execution scope.
+CreateRangeDrawings() =>
+    box nextRangeBox = box.new(bar_index, close, bar_index, close, border_color = rangeColor, bgcolor = color.new(rangeColor, rangeTransparency))
+    line nextRangeHighLine = line.new(bar_index, close, bar_index, close, color = rangeColor)
+    line nextRangeLowLine = line.new(bar_index, close, bar_index, close, color = rangeColor)
+    line nextRangeMidLine = line.new(bar_index, close, bar_index, close, color = color.new(rangeColor, 30), style = line.style_dashed)
+    label nextRangeHighLabel = label.new(bar_index, close, "", style = label.style_label_left, color = color.new(rangeColor, 80), textcolor = color.white, size = size.tiny)
+    label nextRangeLowLabel = label.new(bar_index, close, "", style = label.style_label_left, color = color.new(rangeColor, 80), textcolor = color.white, size = size.tiny)
+    label nextRangeWidthLabel = label.new(bar_index, close, "", style = label.style_label_left, color = color.new(rangeColor, 80), textcolor = color.white, size = size.tiny)
+    [nextRangeBox, nextRangeHighLine, nextRangeLowLine, nextRangeMidLine, nextRangeHighLabel, nextRangeLowLabel, nextRangeWidthLabel]
 
 // Shows the latest opening range using reused box, line, and label objects.
 UpdateRangeDrawings() =>
-    EnsureDrawings()
     bool hasRange = not na(rangeState.high) and not na(rangeState.low)
     int leftBar = math.max(0, bar_index - rangeState.bars + 1)
     if hasRange and showRangeBox
@@ -552,18 +524,20 @@ var label trendLabel = na
 TrendColor() =>
     IsBullTrend() ? color.lime : IsBearTrend() ? color.red : color.gray
 
-// Updates one reusable label with the current normalized trend state.
-UpdateTrendLabel() =>
+// Calculates the reusable trend-label reference without mutating global state.
+CalculateTrendLabel(label previousLabel) =>
+    label nextLabel = previousLabel
     if showTrendLabel and barstate.islast
         string labelText = TrendDirectionText(GetTrendDirection()) + " " + str.tostring(GetTrendScore(), "#.##") + " / " + TrendStrengthText(trendState.strength)
-        if na(trendLabel)
-            trendLabel := label.new(bar_index, high, labelText, style = label.style_label_down, color = TrendColor(), textcolor = color.white, size = size.small)
+        if na(nextLabel)
+            nextLabel := label.new(bar_index, high, labelText, style = label.style_label_down, color = TrendColor(), textcolor = color.white, size = size.small)
         else
-            label.set_xy(trendLabel, bar_index, high)
-            label.set_text(trendLabel, labelText)
-            label.set_color(trendLabel, TrendColor())
-    else if not na(trendLabel)
-        label.set_color(trendLabel, color.new(TrendColor(), 100))
+            label.set_xy(nextLabel, bar_index, high)
+            label.set_text(nextLabel, labelText)
+            label.set_color(nextLabel, TrendColor())
+    else if not na(nextLabel)
+        label.set_color(nextLabel, color.new(TrendColor(), 100))
+    nextLabel
 
 //============================================================================== 
 // 11. DASHBOARD AND DEBUG
@@ -625,21 +599,64 @@ float confirmedPivotLow = ta.pivotlow(low, pivotLength, pivotLength)
 bool symbolMatches = str.contains(str.upper(syminfo.tickerid), str.upper(expectedSymbol))
 
 if barstate.isconfirmed
-    UpdateTrendEngine(fastEmaValue, slowEmaValue, htfFastEmaValue, htfSlowEmaValue, vwapValue, adxValue, plusDiValue, minusDiValue, confirmedPivotHigh, confirmedPivotLow)
-    UpdateSessionEngine()
+    [nextPriorSwingHigh, nextPriorSwingLow, nextCurrentSwingHigh, nextCurrentSwingLow, nextStructure, nextStructureBreak] = CalculateMarketStructure(priorSwingHigh, priorSwingLow, trendState.swingHigh, trendState.swingLow, trendState.structure, confirmedPivotHigh, confirmedPivotLow)
+    [nextTrendDirection, nextTrendStrength, nextTrendScore, nextVwapDistance, nextVwapSlope, nextIsTrending] = CalculateTrendState(fastEmaValue, slowEmaValue, htfFastEmaValue, htfSlowEmaValue, vwapValue, vwapValue[1], adxValue, plusDiValue, minusDiValue, nextStructure)
+
+    // Persistent Trend Engine state is assigned only from the main execution scope.
+    priorSwingHigh := nextPriorSwingHigh
+    priorSwingLow := nextPriorSwingLow
+    trendState.swingHigh := nextCurrentSwingHigh
+    trendState.swingLow := nextCurrentSwingLow
+    trendState.structure := nextStructure
+    trendState.structureBreak := nextStructureBreak
+    trendState.fastEma := fastEmaValue
+    trendState.slowEma := slowEmaValue
+    trendState.htfFastEma := htfFastEmaValue
+    trendState.htfSlowEma := htfSlowEmaValue
+    trendState.vwapValue := vwapValue
+    trendState.vwapDistance := nextVwapDistance
+    trendState.vwapSlope := nextVwapSlope
+    trendState.adx := adxValue
+    trendState.plusDi := plusDiValue
+    trendState.minusDi := minusDiValue
+    trendState.isTrending := nextIsTrending
+    trendState.score := nextTrendScore
+    trendState.direction := nextTrendDirection
+    trendState.strength := nextTrendStrength
+    sessionState := CalculateSessionState(sessionState)
     if sessionState.justEnded
         if rangeState.isComplete
-            RecordCompletedRange()
+            sessionStatistics := CalculateCompletedRangeStatistics(sessionStatistics, rangeState)
         tradeControl.sessionLocked := true
         breakoutState := BreakoutState.SessionFinished
     if enabled and symbolMatches and sessionState.justStarted
-        ResetForSession()
+        [nextRangeState, nextTradeControl, nextBreakoutDirection, nextAtrAtCompletion, nextBreakoutState] = CreateSessionRange()
+        rangeState := nextRangeState
+        tradeControl := nextTradeControl
+        breakoutDirection := nextBreakoutDirection
+        atrAtRangeCompletion := nextAtrAtCompletion
+        breakoutState := nextBreakoutState
     if enabled and symbolMatches and sessionState.isActive
-        BuildOpeningRange(atrValue)
-        UpdateBreakoutState()
+        [nextRangeState, nextAtrAtCompletion, nextBreakoutState] = CalculateOpeningRange(rangeState, atrValue)
+        rangeState := nextRangeState
+        atrAtRangeCompletion := nextAtrAtCompletion
+        breakoutState := nextBreakoutState
+        [nextBreakoutDirection, nextBreakoutState, nextSessionStatistics] = CalculateBreakoutState(rangeState, breakoutState, breakoutDirection, sessionStatistics)
+        breakoutDirection := nextBreakoutDirection
+        breakoutState := nextBreakoutState
+        sessionStatistics := nextSessionStatistics
 
+if na(rangeBox)
+    [nextRangeBox, nextRangeHighLine, nextRangeLowLine, nextRangeMidLine, nextRangeHighLabel, nextRangeLowLabel, nextRangeWidthLabel] = CreateRangeDrawings()
+    rangeBox := nextRangeBox
+    rangeHighLine := nextRangeHighLine
+    rangeLowLine := nextRangeLowLine
+    rangeMidLine := nextRangeMidLine
+    rangeHighLabel := nextRangeHighLabel
+    rangeLowLabel := nextRangeLowLabel
+    rangeWidthLabel := nextRangeWidthLabel
+trendLabel := CalculateTrendLabel(trendLabel)
 UpdateRangeDrawings()
-UpdateTrendLabel()
 UpdateDashboard()
 UpdateDebugPanel()
 
