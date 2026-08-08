@@ -1,11 +1,13 @@
 //@version=6
 // XAUUSD Institutional Framework
-// Version: 0.3.0
+// Version: 0.4.0
 //
 // Session and Opening Range engine. Every state mutation happens on confirmed
 // bars, so the engine never uses future values or repainting calculations.
 //
 // Changelog:
+// - 0.4.0: Added confirmed-candle breakout state, buffers, candle quality,
+//          momentum, scoring, failure/attempt controls, visuals, and dashboard.
 // - 0.3.0: Added the non-repainting Trend Engine (EMA, HTF EMA, VWAP, ADX,
 //          pivot-based market structure, normalized scoring, and visuals).
 // - 0.2.0: Added the Session and Opening Range engines.
@@ -13,7 +15,7 @@
 //============================================================================== 
 // 1. STRATEGY DECLARATION
 //============================================================================== 
-strategy("XAUUSD Institutional Framework v0.3.0", "XAUUSD v0.3.0", overlay = true,
+strategy("XAUUSD Institutional Framework v0.4.0", "XAUUSD v0.4.0", overlay = true,
      pyramiding = 0, calc_on_every_tick = false, calc_on_order_fills = false,
      process_orders_on_close = true, initial_capital = 10000, currency = currency.USD,
      default_qty_type = strategy.percent_of_equity, default_qty_value = 1)
@@ -21,7 +23,7 @@ strategy("XAUUSD Institutional Framework v0.3.0", "XAUUSD v0.3.0", overlay = tru
 //============================================================================== 
 // 2. CONSTANTS AND ENUMS
 //============================================================================== 
-string STRATEGY_VERSION = "0.3.0"
+string STRATEGY_VERSION = "0.4.0"
 string DASHBOARD_TITLE = "XAUUSD SESSION ENGINE"
 int MILLISECONDS_PER_MINUTE = 60000
 int ATR_LENGTH = 14
@@ -34,14 +36,37 @@ enum SessionName
     Custom
 
 enum BreakoutState
-    Waiting
-    BuildingRange
-    RangeCompleted
-    BreakoutPending
-    BreakoutConfirmed
-    RetestPending
-    TradeActive
-    SessionFinished
+    None
+    BullishCandidate
+    BearishCandidate
+    BullishConfirmed
+    BearishConfirmed
+    BullishFailed
+    BearishFailed
+    Invalidated
+
+enum BreakoutStrength
+    Weak
+    Normal
+    Strong
+    Extreme
+
+enum TradeDirection
+    None
+    Long
+    Short
+
+enum BreakoutBufferMode
+    Ticks
+    Percentage
+    Atr
+
+enum BreakoutConfirmationMode
+    CloseOnly
+    ClosePlusBuffer
+    CandleQuality
+    CandlePlusMomentum
+    FullConfirmation
 
 enum TrendDirection
     Bullish
@@ -73,6 +98,7 @@ string GROUP_VISUALS = "7. Visuals"
 string GROUP_DASHBOARD = "8. Dashboard and Debug"
 string GROUP_TREND = "9. Trend Engine"
 string GROUP_TREND_VISUALS = "10. Trend Visuals"
+string GROUP_BREAKOUT = "11. Breakout Engine"
 
 bool enabled = input.bool(true, "Enable strategy", group = GROUP_GENERAL)
 string expectedSymbol = input.string("XAUUSD", "Expected symbol", group = GROUP_GENERAL)
@@ -123,6 +149,29 @@ int pivotLength = input.int(5, "Market structure pivot length", minval = 1, grou
 bool showEmaPlots = input.bool(true, "Plot EMAs", group = GROUP_TREND_VISUALS)
 bool showTrendBackground = input.bool(false, "Color trend background", group = GROUP_TREND_VISUALS)
 bool showTrendLabel = input.bool(false, "Show trend label", group = GROUP_TREND_VISUALS)
+bool breakoutEnabled = input.bool(true, "Enable breakout engine", group = GROUP_BREAKOUT)
+BreakoutConfirmationMode breakoutMode = input.enum(BreakoutConfirmationMode.FullConfirmation, "Confirmation mode", group = GROUP_BREAKOUT)
+BreakoutBufferMode breakoutBufferMode = input.enum(BreakoutBufferMode.Atr, "Buffer mode", group = GROUP_BREAKOUT)
+float breakoutBufferValue = input.float(0.10, "Buffer value", minval = 0.0, group = GROUP_BREAKOUT)
+float minimumBodyPercent = input.float(55.0, "Minimum body %", minval = 0, maxval = 100, group = GROUP_BREAKOUT)
+float maximumRejectionWickPercent = input.float(25.0, "Maximum rejection wick %", minval = 0, maxval = 100, group = GROUP_BREAKOUT)
+float minimumClosePositionPercent = input.float(70.0, "Minimum close position %", minval = 0, maxval = 100, group = GROUP_BREAKOUT)
+bool useAtrExpansionFilter = input.bool(true, "Enable ATR expansion filter", group = GROUP_BREAKOUT)
+float minimumBreakoutRangeAtr = input.float(0.75, "Minimum range / ATR", minval = 0, group = GROUP_BREAKOUT)
+float minimumAtrExpansion = input.float(1.0, "Minimum ATR expansion", minval = 0, group = GROUP_BREAKOUT)
+bool requireTrendAlignment = input.bool(false, "Require trend alignment", group = GROUP_BREAKOUT)
+bool requireHtfAlignment = input.bool(false, "Require HTF alignment", group = GROUP_BREAKOUT)
+bool requireVwapAlignment = input.bool(false, "Require VWAP alignment", group = GROUP_BREAKOUT)
+bool requireAdxConfirmation = input.bool(false, "Require ADX confirmation", group = GROUP_BREAKOUT)
+bool enableFailureDetection = input.bool(true, "Enable failure detection", group = GROUP_BREAKOUT)
+int failureConfirmationBars = input.int(1, "Failure confirmation bars", minval = 1, group = GROUP_BREAKOUT)
+float failureBuffer = input.float(0.0, "Failure buffer", minval = 0, group = GROUP_BREAKOUT)
+bool allowMultipleBreakoutAttempts = input.bool(false, "Allow multiple attempts", group = GROUP_BREAKOUT)
+string breakoutValidityWindow = input.string("60", "Validity window", options = ["30", "60", "90", "120", "Entire session"], group = GROUP_BREAKOUT)
+float minimumBreakoutScore = input.float(55.0, "Minimum breakout score", minval = 0, maxval = 100, group = GROUP_BREAKOUT)
+bool showBreakoutMarkers = input.bool(true, "Show breakout markers", group = GROUP_BREAKOUT)
+bool showBreakoutScore = input.bool(true, "Show breakout score", group = GROUP_BREAKOUT)
+bool showBreakoutLevels = input.bool(true, "Show breakout levels", group = GROUP_BREAKOUT)
 
 //============================================================================== 
 // 4. STATE MODELS
@@ -189,15 +238,43 @@ type TrendEngineState
     bool structureBreak
     bool isTrending
 
+type BreakoutEngineState
+    BreakoutState state
+    int direction
+    float price
+    float score
+    BreakoutStrength strength
+    float distance
+    float distancePercent
+    float distanceAtr
+    bool attempted
+    bool confirmed
+    bool failed
+    int barIndex
+    int failureBars
+
 var SessionEngineState sessionState = SessionEngineState.new(SessionName.None, false, false, false, na, 0, 0, 0.0, 0)
 var OpeningRangeState rangeState = OpeningRangeState.new(na, na, na, na, na, na, na, na, na, 0, false, false, false)
 var TradeControlState tradeControl = TradeControlState.new(false, false, false, false)
 var SessionStatistics sessionStatistics = SessionStatistics.new(0, 0.0, na, na, 0.0, 0, 0, 0)
 var TrendEngineState trendState = TrendEngineState.new(TrendDirection.Neutral, TrendStrength.Weak, MarketStructure.Neutral, 0.0, na, na, na, na, na, na, na, na, na, na, na, na, false, false)
 // M2 Session/Opening Range state. The M3 Trend Engine neither reads nor updates it.
-var BreakoutState breakoutState = BreakoutState.Waiting
+var BreakoutState breakoutState = BreakoutState.None
 var int breakoutDirection = 0
 var float atrAtRangeCompletion = na
+var bool breakoutAttempted = false
+var bool breakoutConfirmed = false
+var bool breakoutFailed = false
+var int breakoutBarIndex = na
+var float breakoutPrice = na
+var TradeDirection breakoutTradeDirection = TradeDirection.None
+var float breakoutDistance = na
+var float breakoutDistancePercent = na
+var float breakoutDistanceATR = na
+var float breakoutScore = na
+var BreakoutStrength breakoutStrength = BreakoutStrength.Weak
+var int bullishFailureCount = 0
+var int bearishFailureCount = 0
 
 //============================================================================== 
 // 5. UTILITY FUNCTIONS
@@ -222,14 +299,22 @@ SessionText(SessionName sessionName) =>
 // Returns a readable name for a breakout-state enum value.
 StateText(BreakoutState state) =>
     switch state
-        BreakoutState.Waiting => "Waiting"
-        BreakoutState.BuildingRange => "Building Range"
-        BreakoutState.RangeCompleted => "Range Completed"
-        BreakoutState.BreakoutPending => "Breakout Pending"
-        BreakoutState.BreakoutConfirmed => "Breakout Confirmed"
-        BreakoutState.RetestPending => "Retest Pending"
-        BreakoutState.TradeActive => "Trade Active"
-        => "Session Finished"
+        BreakoutState.BullishCandidate => "Bullish Candidate"
+        BreakoutState.BearishCandidate => "Bearish Candidate"
+        BreakoutState.BullishConfirmed => "Bullish Confirmed"
+        BreakoutState.BearishConfirmed => "Bearish Confirmed"
+        BreakoutState.BullishFailed => "Bullish Failed"
+        BreakoutState.BearishFailed => "Bearish Failed"
+        BreakoutState.Invalidated => "Invalidated"
+        => "None"
+
+// Returns a display label for an M4 breakout direction.
+BreakoutDirectionText(TradeDirection direction) =>
+    direction == TradeDirection.Long ? "Bullish" : direction == TradeDirection.Short ? "Bearish" : "None"
+
+// Returns a display label for every M4 breakout-strength enum member.
+BreakoutStrengthText(BreakoutStrength strength) =>
+    strength == BreakoutStrength.Extreme ? "Extreme" : strength == BreakoutStrength.Strong ? "Strong" : strength == BreakoutStrength.Normal ? "Normal" : "Weak"
 
 // Prevents division-by-zero while preserving a caller supplied fallback value.
 SafeDivide(float numerator, float denominator, float fallback) =>
@@ -386,7 +471,7 @@ CreateSessionRange() =>
     TradeControlState freshTradeControl = TradeControlState.new(false, false, false, false)
     int freshBreakoutDirection = 0
     float freshAtrAtCompletion = na
-    [freshRange, freshTradeControl, freshBreakoutDirection, freshAtrAtCompletion, BreakoutState.BuildingRange]
+    [freshRange, freshTradeControl, freshBreakoutDirection, freshAtrAtCompletion, BreakoutState.None]
 
 // Calculates the next opening-range state from one confirmed chart bar.
 CalculateOpeningRange(OpeningRangeState previousRange, float atrValue) =>
@@ -413,7 +498,7 @@ CalculateOpeningRange(OpeningRangeState previousRange, float atrValue) =>
         nextComplete := true
         nextAtrAtCompletion := atrValue
         nextQualityAccepted := nextAtrRatio >= minimumAtrRatio and nextAtrRatio <= maximumAtrRatio
-        rangeCompletionState := BreakoutState.RangeCompleted
+        rangeCompletionState := BreakoutState.None
     OpeningRangeState nextRange = OpeningRangeState.new(nextHigh, nextLow, nextMid, nextWidth, nextAtrRatio, nextPercent, nextTicks, previousRange.startTime, previousRange.endTime, nextBars, nextBuilding, nextComplete, nextQualityAccepted)
     [nextRange, nextAtrAtCompletion, rangeCompletionState]
 
@@ -433,26 +518,22 @@ CalculateBreakoutState(OpeningRangeState currentRange, BreakoutState currentStat
         bool closesAbove = close > currentRange.high
         bool closesBelow = close < currentRange.low
         bool closesInside = close <= currentRange.high and close >= currentRange.low
-        if currentState == BreakoutState.RangeCompleted and (closesAbove or closesBelow)
+        if currentState == BreakoutState.None and (closesAbove or closesBelow)
             nextDirection := closesAbove ? 1 : -1
-            nextState := BreakoutState.BreakoutPending
-        else if currentState == BreakoutState.BreakoutPending
+            nextState := closesAbove ? BreakoutState.BullishCandidate : BreakoutState.BearishCandidate
+        else if currentState == BreakoutState.BullishCandidate or currentState == BreakoutState.BearishCandidate
             bool confirms = nextDirection == 1 ? closesAbove : closesBelow
             if confirms
-                nextState := BreakoutState.BreakoutConfirmed
+                nextState := nextDirection == 1 ? BreakoutState.BullishConfirmed : BreakoutState.BearishConfirmed
                 nextStatistics := SessionStatistics.new(previousStatistics.sessions, previousStatistics.totalRange, previousStatistics.largestRange, previousStatistics.smallestRange, previousStatistics.totalAtrRatio, previousStatistics.breakouts + 1, previousStatistics.falseBreakouts, previousStatistics.successfulBreakouts + 1)
             else if closesInside
-                nextState := BreakoutState.RangeCompleted
+                nextState := BreakoutState.None
                 nextDirection := 0
                 nextStatistics := SessionStatistics.new(previousStatistics.sessions, previousStatistics.totalRange, previousStatistics.largestRange, previousStatistics.smallestRange, previousStatistics.totalAtrRatio, previousStatistics.breakouts, previousStatistics.falseBreakouts + 1, previousStatistics.successfulBreakouts)
-        else if currentState == BreakoutState.BreakoutConfirmed
-            bool retestsLevel = nextDirection == 1 ? low <= currentRange.high : high >= currentRange.low
-            if retestsLevel
-                nextState := BreakoutState.RetestPending
-        else if currentState == BreakoutState.RetestPending
-            bool resumesBreakout = nextDirection == 1 ? close > currentRange.high : close < currentRange.low
-            if resumesBreakout
-                nextState := BreakoutState.BreakoutConfirmed
+        else if currentState == BreakoutState.BullishConfirmed or currentState == BreakoutState.BearishConfirmed
+            bool fails = nextDirection == 1 ? close <= currentRange.high : close >= currentRange.low
+            if fails
+                nextState := nextDirection == 1 ? BreakoutState.BullishFailed : BreakoutState.BearishFailed
     [nextDirection, nextState, nextStatistics]
 
 //============================================================================== 
@@ -545,7 +626,7 @@ CalculateTrendLabel(label previousLabel) =>
 //============================================================================== 
 // 11. DASHBOARD AND DEBUG
 //============================================================================== 
-var table dashboard = table.new(position.top_right, 2, 15, border_width = 1)
+var table dashboard = table.new(position.top_right, 2, 23, border_width = 1)
 var table debugTable = table.new(position.bottom_right, 2, 6, border_width = 1)
 
 // Writes one consistently styled dashboard row.
@@ -572,8 +653,16 @@ UpdateDashboard() =>
             SetDashboardRow(dashboard, 12, "VWAP status", close > trendState.vwapValue ? "Above" : close < trendState.vwapValue ? "Below" : "At VWAP")
             SetDashboardRow(dashboard, 13, "ADX", str.tostring(trendState.adx, "#.##"))
             SetDashboardRow(dashboard, 14, "Structure", MarketStructureText(GetMarketStructure()))
+            SetDashboardRow(dashboard, 15, "Breakout state", StateText(breakoutState))
+            SetDashboardRow(dashboard, 16, "Breakout direction", BreakoutDirectionText(breakoutTradeDirection))
+            SetDashboardRow(dashboard, 17, "Breakout score", na(breakoutScore) ? "-" : str.tostring(breakoutScore, "#.##"))
+            SetDashboardRow(dashboard, 18, "Breakout strength", BreakoutStrengthText(breakoutStrength))
+            SetDashboardRow(dashboard, 19, "Distance ATR", na(breakoutDistanceATR) ? "-" : str.tostring(breakoutDistanceATR, "#.##"))
+            SetDashboardRow(dashboard, 20, "Breakout attempted", breakoutAttempted ? "Yes" : "No")
+            SetDashboardRow(dashboard, 21, "Breakout confirmed", breakoutConfirmed ? "Yes" : "No")
+            SetDashboardRow(dashboard, 22, "Breakout failed", breakoutFailed ? "Yes" : "No")
         else
-            table.clear(dashboard, 0, 0, 1, 14)
+            table.clear(dashboard, 0, 0, 1, 22)
 
 // Updates the diagnostic panel only on the last chart bar when debugging is enabled.
 UpdateDebugPanel() =>
@@ -592,6 +681,59 @@ UpdateDebugPanel() =>
 // 12. ORCHESTRATION
 //============================================================================== 
 float atrValue = ta.atr(ATR_LENGTH)
+float breakoutBuffer = na(rangeState.high) or na(rangeState.low) ? na : breakoutBufferMode == BreakoutBufferMode.Ticks ? breakoutBufferValue * syminfo.mintick : breakoutBufferMode == BreakoutBufferMode.Percentage ? rangeState.mid * breakoutBufferValue * 0.01 : atrValue * breakoutBufferValue
+float bullishBreakoutThreshold = na(rangeState.high) or na(breakoutBuffer) ? na : rangeState.high + breakoutBuffer
+float bearishBreakoutThreshold = na(rangeState.low) or na(breakoutBuffer) ? na : rangeState.low - breakoutBuffer
+float candleRange = high - low
+float safeCandleRange = math.max(candleRange, syminfo.mintick)
+float candleBody = math.abs(close - open)
+float bodyPercent = candleBody * 100.0 / safeCandleRange
+float upperWick = high - math.max(open, close)
+float lowerWick = math.min(open, close) - low
+float upperWickPercent = upperWick * 100.0 / safeCandleRange
+float lowerWickPercent = lowerWick * 100.0 / safeCandleRange
+float bullishClosePosition = (close - low) * 100.0 / safeCandleRange
+float bearishClosePosition = (high - close) * 100.0 / safeCandleRange
+bool bullishBreakoutSignal = false
+bool bearishBreakoutSignal = false
+bool bullishBreakoutFailure = false
+bool bearishBreakoutFailure = false
+bool bullishCandleQuality = close > open and bodyPercent >= minimumBodyPercent and upperWickPercent <= maximumRejectionWickPercent and bullishClosePosition >= minimumClosePositionPercent
+bool bearishCandleQuality = close < open and bodyPercent >= minimumBodyPercent and lowerWickPercent <= maximumRejectionWickPercent and bearishClosePosition >= minimumClosePositionPercent
+float breakoutCandleATR = SafeDivide(candleRange, atrValue, na)
+float breakoutDistanceATRCurrent = na(bullishBreakoutThreshold) ? na : SafeDivide(math.max(math.max(0.0, close - bullishBreakoutThreshold), math.max(0.0, bearishBreakoutThreshold - close)), atrValue, na)
+float atrExpansionBaseline = ta.sma(atrValue, ATR_LENGTH)
+float atrExpansionRatio = SafeDivide(atrValue, atrExpansionBaseline, na)
+bool bullishMomentumValid = breakoutCandleATR >= minimumBreakoutRangeAtr and (not useAtrExpansionFilter or atrExpansionRatio >= minimumAtrExpansion)
+bool bearishMomentumValid = bullishMomentumValid
+bool bullishTrendAligned = GetTrendDirection() == TrendDirection.Bullish
+bool bearishTrendAligned = GetTrendDirection() == TrendDirection.Bearish
+bool bullishHTFAligned = trendState.htfFastEma > trendState.htfSlowEma
+bool bearishHTFAligned = trendState.htfFastEma < trendState.htfSlowEma
+bool bullishVWAPAligned = close > trendState.vwapValue
+bool bearishVWAPAligned = close < trendState.vwapValue
+bool bullishADXAligned = trendState.isTrending and trendState.plusDi > trendState.minusDi
+bool bearishADXAligned = trendState.isTrending and trendState.minusDi > trendState.plusDi
+bool bullishTrendRequirementsPass = (not requireTrendAlignment or bullishTrendAligned) and (not requireHtfAlignment or bullishHTFAligned) and (not requireVwapAlignment or bullishVWAPAligned) and (not requireAdxConfirmation or bullishADXAligned)
+bool bearishTrendRequirementsPass = (not requireTrendAlignment or bearishTrendAligned) and (not requireHtfAlignment or bearishHTFAligned) and (not requireVwapAlignment or bearishVWAPAligned) and (not requireAdxConfirmation or bearishADXAligned)
+bool breakoutRangeQualityValid = rangeState.isComplete and rangeState.qualityAccepted
+bool bullishCloseOutsideRange = barstate.isconfirmed and close > rangeState.high
+bool bearishCloseOutsideRange = barstate.isconfirmed and close < rangeState.low
+bool bullishCloseOutsideBuffer = barstate.isconfirmed and close > bullishBreakoutThreshold
+bool bearishCloseOutsideBuffer = barstate.isconfirmed and close < bearishBreakoutThreshold
+bool bullishBreakoutCandidate = breakoutEnabled and breakoutRangeQualityValid and (breakoutMode == BreakoutConfirmationMode.CloseOnly ? bullishCloseOutsideRange : breakoutMode == BreakoutConfirmationMode.ClosePlusBuffer ? bullishCloseOutsideBuffer : breakoutMode == BreakoutConfirmationMode.CandleQuality ? bullishCloseOutsideBuffer and bullishCandleQuality : breakoutMode == BreakoutConfirmationMode.CandlePlusMomentum ? bullishCloseOutsideBuffer and bullishCandleQuality and bullishMomentumValid : bullishCloseOutsideBuffer and bullishCandleQuality and bullishMomentumValid and bullishTrendRequirementsPass)
+bool bearishBreakoutCandidate = breakoutEnabled and breakoutRangeQualityValid and (breakoutMode == BreakoutConfirmationMode.CloseOnly ? bearishCloseOutsideRange : breakoutMode == BreakoutConfirmationMode.ClosePlusBuffer ? bearishCloseOutsideBuffer : breakoutMode == BreakoutConfirmationMode.CandleQuality ? bearishCloseOutsideBuffer and bearishCandleQuality : breakoutMode == BreakoutConfirmationMode.CandlePlusMomentum ? bearishCloseOutsideBuffer and bearishCandleQuality and bearishMomentumValid : bearishCloseOutsideBuffer and bearishCandleQuality and bearishMomentumValid and bearishTrendRequirementsPass)
+float bullishBreakoutScore = math.max(0.0, math.min(100.0, (bullishCandleQuality ? 25.0 : 0.0) + (bullishMomentumValid ? 20.0 : 0.0) + (bullishTrendAligned ? 20.0 : 0.0) + (bullishHTFAligned ? 15.0 : 0.0) + ((bullishVWAPAligned and bullishADXAligned) ? 10.0 : 0.0) + (breakoutRangeQualityValid ? 10.0 : 0.0)))
+float bearishBreakoutScore = math.max(0.0, math.min(100.0, (bearishCandleQuality ? 25.0 : 0.0) + (bearishMomentumValid ? 20.0 : 0.0) + (bearishTrendAligned ? 20.0 : 0.0) + (bearishHTFAligned ? 15.0 : 0.0) + ((bearishVWAPAligned and bearishADXAligned) ? 10.0 : 0.0) + (breakoutRangeQualityValid ? 10.0 : 0.0)))
+BreakoutStrength bullishBreakoutStrength = bullishBreakoutScore >= 85.0 ? BreakoutStrength.Extreme : bullishBreakoutScore >= 65.0 ? BreakoutStrength.Strong : bullishBreakoutScore >= 40.0 ? BreakoutStrength.Normal : BreakoutStrength.Weak
+BreakoutStrength bearishBreakoutStrength = bearishBreakoutScore >= 85.0 ? BreakoutStrength.Extreme : bearishBreakoutScore >= 65.0 ? BreakoutStrength.Strong : bearishBreakoutScore >= 40.0 ? BreakoutStrength.Normal : BreakoutStrength.Weak
+bool bullishBreakoutQualityPass = bullishBreakoutScore >= minimumBreakoutScore
+bool bearishBreakoutQualityPass = bearishBreakoutScore >= minimumBreakoutScore
+int breakoutWindowMinutes = breakoutValidityWindow == "Entire session" ? 0 : int(str.tonumber(breakoutValidityWindow))
+bool breakoutWindowValid = rangeState.isComplete and sessionState.isActive and (breakoutWindowMinutes == 0 or time <= rangeState.endTime + breakoutWindowMinutes * MILLISECONDS_PER_MINUTE)
+bool breakoutAttemptGate = allowMultipleBreakoutAttempts or not breakoutAttempted
+bool bullishBreakoutAccepted = barstate.isconfirmed and breakoutWindowValid and breakoutAttemptGate and bullishBreakoutCandidate and bullishBreakoutQualityPass and not bearishBreakoutCandidate
+bool bearishBreakoutAccepted = barstate.isconfirmed and breakoutWindowValid and breakoutAttemptGate and bearishBreakoutCandidate and bearishBreakoutQualityPass and not bullishBreakoutCandidate
 float fastEmaValue = ta.ema(close, fastEmaLength)
 float slowEmaValue = ta.ema(close, slowEmaLength)
 [htfFastEmaValue, htfSlowEmaValue] = request.security(syminfo.tickerid, htfTimeframe, [ta.ema(close, fastEmaLength), ta.ema(close, slowEmaLength)], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
@@ -631,7 +773,7 @@ if barstate.isconfirmed
         if rangeState.isComplete
             sessionStatistics := CalculateCompletedRangeStatistics(sessionStatistics, rangeState)
         tradeControl.sessionLocked := true
-        breakoutState := BreakoutState.SessionFinished
+        breakoutState := BreakoutState.Invalidated
     if enabled and symbolMatches and sessionState.justStarted
         [resetRangeState, resetTradeControl, resetBreakoutDirection, resetAtrAtCompletion, resetBreakoutState] = CreateSessionRange()
         rangeState := resetRangeState
@@ -639,6 +781,19 @@ if barstate.isconfirmed
         breakoutDirection := resetBreakoutDirection
         atrAtRangeCompletion := resetAtrAtCompletion
         breakoutState := resetBreakoutState
+        breakoutAttempted := false
+        breakoutConfirmed := false
+        breakoutFailed := false
+        breakoutBarIndex := na
+        breakoutPrice := na
+        breakoutTradeDirection := TradeDirection.None
+        breakoutDistance := na
+        breakoutDistancePercent := na
+        breakoutDistanceATR := na
+        breakoutScore := na
+        breakoutStrength := BreakoutStrength.Weak
+        bullishFailureCount := 0
+        bearishFailureCount := 0
     if enabled and symbolMatches and sessionState.isActive
         [calculatedRangeState, calculatedAtrAtCompletion, calculatedRangeBreakoutState] = CalculateOpeningRange(rangeState, atrValue)
         rangeState := calculatedRangeState
@@ -648,6 +803,62 @@ if barstate.isconfirmed
         breakoutDirection := calculatedBreakoutDirection
         breakoutState := calculatedBreakoutState
         sessionStatistics := calculatedSessionStatistics
+
+    // M4-C event outputs reset every confirmed bar; persistent state is retained.
+    bullishBreakoutSignal := false
+    bearishBreakoutSignal := false
+    bullishBreakoutFailure := false
+    bearishBreakoutFailure := false
+    if bullishBreakoutAccepted
+        breakoutState := BreakoutState.BullishConfirmed
+        breakoutAttempted := true
+        breakoutConfirmed := true
+        breakoutFailed := false
+        breakoutBarIndex := bar_index
+        breakoutPrice := close
+        breakoutTradeDirection := TradeDirection.Long
+        breakoutDistance := close - rangeState.high
+        breakoutDistancePercent := SafeDivide(breakoutDistance * 100.0, rangeState.high, na)
+        breakoutDistanceATR := SafeDivide(breakoutDistance, atrValue, na)
+        breakoutScore := bullishBreakoutScore
+        breakoutStrength := bullishBreakoutStrength
+        bullishBreakoutSignal := true
+        bullishFailureCount := 0
+        bearishFailureCount := 0
+    else if bearishBreakoutAccepted
+        breakoutState := BreakoutState.BearishConfirmed
+        breakoutAttempted := true
+        breakoutConfirmed := true
+        breakoutFailed := false
+        breakoutBarIndex := bar_index
+        breakoutPrice := close
+        breakoutTradeDirection := TradeDirection.Short
+        breakoutDistance := rangeState.low - close
+        breakoutDistancePercent := SafeDivide(breakoutDistance * 100.0, rangeState.low, na)
+        breakoutDistanceATR := SafeDivide(breakoutDistance, atrValue, na)
+        breakoutScore := bearishBreakoutScore
+        breakoutStrength := bearishBreakoutStrength
+        bearishBreakoutSignal := true
+        bullishFailureCount := 0
+        bearishFailureCount := 0
+    if enableFailureDetection and breakoutState == BreakoutState.BullishConfirmed
+        bullishFailureCount := close <= rangeState.high - failureBuffer ? bullishFailureCount + 1 : 0
+        if bullishFailureCount >= failureConfirmationBars
+            breakoutState := BreakoutState.BullishFailed
+            breakoutConfirmed := false
+            breakoutFailed := true
+            bullishBreakoutFailure := true
+    else if enableFailureDetection and breakoutState == BreakoutState.BearishConfirmed
+        bearishFailureCount := close >= rangeState.low + failureBuffer ? bearishFailureCount + 1 : 0
+        if bearishFailureCount >= failureConfirmationBars
+            breakoutState := BreakoutState.BearishFailed
+            breakoutConfirmed := false
+            breakoutFailed := true
+            bearishBreakoutFailure := true
+    if not sessionState.isActive and not breakoutConfirmed and not breakoutFailed
+        breakoutState := BreakoutState.Invalidated
+    else if rangeState.isComplete and not breakoutWindowValid and not breakoutConfirmed and not breakoutFailed
+        breakoutState := BreakoutState.Invalidated
 
 if na(rangeBox)
     [nextRangeBox, nextRangeHighLine, nextRangeLowLine, nextRangeMidLine, nextRangeHighLabel, nextRangeLowLabel, nextRangeWidthLabel] = CreateRangeDrawings()
@@ -667,3 +878,9 @@ plot(showEmaPlots ? fastEmaValue : na, "Fast EMA", color = color.teal, linewidth
 plot(showEmaPlots ? slowEmaValue : na, "Slow EMA", color = color.orange, linewidth = 2)
 color trendBackground = IsBullTrend() ? color.new(color.lime, 90) : IsBearTrend() ? color.new(color.red, 90) : color.new(color.gray, 95)
 bgcolor(showTrendBackground ? trendBackground : na, title = "Trend Background")
+plot(showBreakoutLevels and (breakoutConfirmed or breakoutFailed) ? breakoutPrice : na, "Breakout Level", color = breakoutTradeDirection == TradeDirection.Long ? color.lime : breakoutTradeDirection == TradeDirection.Short ? color.red : color.gray, linewidth = 2, style = plot.style_linebr)
+plotshape(showBreakoutMarkers and bullishBreakoutSignal, "Bullish Breakout", shape.triangleup, location.belowbar, color.lime, size = size.small)
+plotshape(showBreakoutMarkers and bearishBreakoutSignal, "Bearish Breakout", shape.triangledown, location.abovebar, color.red, size = size.small)
+plotshape(showBreakoutMarkers and bullishBreakoutFailure, "Bullish Breakout Failure", shape.xcross, location.abovebar, color.orange, size = size.tiny)
+plotshape(showBreakoutMarkers and bearishBreakoutFailure, "Bearish Breakout Failure", shape.xcross, location.belowbar, color.orange, size = size.tiny)
+plotchar(showBreakoutScore and (bullishBreakoutSignal or bearishBreakoutSignal) ? breakoutScore : na, "Breakout Score", "•", location.top, color = color.white)
