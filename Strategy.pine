@@ -383,7 +383,9 @@ CalculateSessionState(SessionEngineState previousState) =>
 CreateSessionRange() =>
     OpeningRangeState freshRange = OpeningRangeState.new(na, na, na, na, na, na, na, time, time + OpeningRangeMinutes() * MILLISECONDS_PER_MINUTE, 0, true, false, false)
     TradeControlState freshTradeControl = TradeControlState.new(false, false, false, false)
-    [freshRange, freshTradeControl, 0, na, BreakoutState.BuildingRange]
+    int freshBreakoutDirection = 0
+    float freshAtrAtCompletion = na
+    [freshRange, freshTradeControl, freshBreakoutDirection, freshAtrAtCompletion, BreakoutState.BuildingRange]
 
 // Calculates the next opening-range state from one confirmed chart bar.
 CalculateOpeningRange(OpeningRangeState previousRange, float atrValue) =>
