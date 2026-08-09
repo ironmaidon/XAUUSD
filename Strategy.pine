@@ -1,11 +1,15 @@
 //@version=6
 // XAUUSD Institutional Framework
-// Version: 0.11.0
+// Version: 1.0.0
+// Release: Production Release Candidate (not live-broker certified)
 //
-// Session and Opening Range engine. Every state mutation happens on confirmed
-// bars, so the engine never uses future values or repainting calculations.
+// Deterministic XAUUSD framework. Lifecycle transitions use confirmed bars;
+// HTF requests and pivots are configured to avoid future-data calculations.
 //
 // Changelog:
+// - 1.0.0: M12 release-candidate integration audit. Preserves signal, risk,
+//          order, and alert behavior; bounds qualified-setup score labels and
+//          adds configuration diagnostics and release documentation.
 // - 0.11.0: Added M11 configurable confirmed-bar alerts, bounded dynamic
 //           webhook payloads, deterministic event priority, risk-block
 //           transitions, and alert diagnostics.
@@ -42,7 +46,7 @@
 //============================================================================== 
 // 1. STRATEGY DECLARATION
 //============================================================================== 
-strategy("XAUUSD Institutional Framework v0.11.0", "XAUUSD v0.11.0", overlay = true,
+strategy("XAUUSD Institutional Framework v1.0.0", "XAUUSD v1.0.0", overlay = true,
      pyramiding = 0, calc_on_every_tick = false, calc_on_order_fills = false,
      process_orders_on_close = true, initial_capital = 10000, currency = currency.USD,
      default_qty_type = strategy.percent_of_equity, default_qty_value = 1)
@@ -50,7 +54,7 @@ strategy("XAUUSD Institutional Framework v0.11.0", "XAUUSD v0.11.0", overlay = t
 //============================================================================== 
 // 2. CONSTANTS AND ENUMS
 //============================================================================== 
-string STRATEGY_VERSION = "0.11.0"
+string STRATEGY_VERSION = "1.0.0"
 string DASHBOARD_TITLE = "XAUUSD PRODUCTION MONITOR"
 int MILLISECONDS_PER_MINUTE = 60000
 int ATR_LENGTH = 14
@@ -633,6 +637,16 @@ int superTrendAtrLength = input.int(10, "SuperTrend ATR Length", minval = 1, gro
 float superTrendFactor = input.float(3.0, "SuperTrend Factor", minval = 0.1, group = GROUP_TRADE_MANAGEMENT)
 int swingTrailPivotLength = input.int(5, "Swing Trail Pivot Length", minval = 1, group = GROUP_TRADE_MANAGEMENT)
 float swingTrailBuffer = input.float(0.0, "Swing Trail Buffer (Ticks)", minval = 0.0, group = GROUP_TRADE_MANAGEMENT)
+
+// M12 configuration diagnostics are presentation-only. Unsafe configurations
+// remain rejected by their owning M2, M6, M8, or M9 guards; these booleans make
+// the cause visible without silently normalizing user input.
+bool openingRangeConfigurationValid = minimumAtrRatio <= maximumAtrRatio
+bool sweepConfigurationValid = minimumSweepPenetrationValue <= maximumSweepPenetrationValue
+bool stopDistanceConfigurationValid = minimumStopDistanceAtr <= maximumStopDistanceAtr
+bool quantityConfigurationValid = quantityStep > 0.0 and maximumPositionQuantity > 0.0 and maximumPositionQuantity >= minimumPositionQuantity
+bool targetAllocationConfigurationValid = not (useTp1 and useTp2) or tp1QuantityPercent > 0.0 and tp2QuantityPercent > 0.0 and math.abs(tp1QuantityPercent + tp2QuantityPercent - 100.0) <= 0.000001
+bool releaseConfigurationValid = openingRangeConfigurationValid and sweepConfigurationValid and stopDistanceConfigurationValid and quantityConfigurationValid and targetAllocationConfigurationValid
 
 //============================================================================== 
 // 4. STATE MODELS
@@ -1538,6 +1552,10 @@ UpdateRangeDrawings() =>
 // 10. TREND VISUALS
 //==============================================================================
 var label trendLabel = na
+// M12 keeps at most one score label per qualified direction. This avoids the
+// historical label accumulation that could otherwise exhaust Pine resources.
+var label bullishSetupScoreLabel = na
+var label bearishSetupScoreLabel = na
 
 // Returns a display color for the current normalized trend direction.
 TrendColor() =>
@@ -1674,6 +1692,8 @@ UpdateDashboard() =>
                     SetDashboardStatusRow(dashboard, 71, "Alerts / Webhook", (alertsEnabled ? "ON" : "OFF") + " / " + (webhookMessagesEnabled ? "ON" : "OFF"), alertsEnabled ? color.lime : color.silver)
                     SetDashboardRow(dashboard, 72, "Last Alert", AlertEventText(lastAlertEventType))
                     SetDashboardRow(dashboard, 73, "Last Alert Bar", FormatIntOrDash(lastAlertBarIndex))
+                    SetDashboardStatusRow(dashboard, 74, "Release Config", releaseConfigurationValid ? "VALID" : "CHECK INPUTS", releaseConfigurationValid ? color.lime : color.orange)
+                    SetDashboardRow(dashboard, 75, "Config Detail", (openingRangeConfigurationValid ? "OR" : "OR!") + " / " + (sweepConfigurationValid ? "Sweep" : "Sweep!") + " / " + (stopDistanceConfigurationValid ? "Stop" : "Stop!") + " / " + (quantityConfigurationValid ? "Qty" : "Qty!") + " / " + (targetAllocationConfigurationValid ? "TP" : "TP!"))
         else
             table.clear(dashboard, 0, 0, 1, 95)
 
@@ -3421,9 +3441,17 @@ plotchar(showRetestScore and (bullishRetestConfirmed or bearishRetestConfirmed) 
 plotshape(showChartVisuals and showSignalMarkers and showQualifiedSetupMarkers and bullishTradeQualifiedEvent, "Bullish Qualified Setup", shape.labelup, location.belowbar, color.lime, text = "LONG", textcolor = color.white, size = size.small)
 plotshape(showChartVisuals and showSignalMarkers and showQualifiedSetupMarkers and bearishTradeQualifiedEvent, "Bearish Qualified Setup", shape.labeldown, location.abovebar, color.red, text = "SHORT", textcolor = color.white, size = size.small)
 if showChartVisuals and showSignalMarkers and showSetupScore and bullishTradeQualifiedEvent
-    label.new(bar_index, low, "LONG " + FormatValueOrDash(tradeSetupScore), style = label.style_label_up, color = color.lime, textcolor = color.white, size = size.tiny)
+    if na(bullishSetupScoreLabel)
+        bullishSetupScoreLabel := label.new(bar_index, low, "LONG " + FormatValueOrDash(tradeSetupScore), style = label.style_label_up, color = color.lime, textcolor = color.white, size = size.tiny)
+    else
+        label.set_xy(bullishSetupScoreLabel, bar_index, low)
+        label.set_text(bullishSetupScoreLabel, "LONG " + FormatValueOrDash(tradeSetupScore))
 if showChartVisuals and showSignalMarkers and showSetupScore and bearishTradeQualifiedEvent
-    label.new(bar_index, high, "SHORT " + FormatValueOrDash(tradeSetupScore), style = label.style_label_down, color = color.red, textcolor = color.white, size = size.tiny)
+    if na(bearishSetupScoreLabel)
+        bearishSetupScoreLabel := label.new(bar_index, high, "SHORT " + FormatValueOrDash(tradeSetupScore), style = label.style_label_down, color = color.red, textcolor = color.white, size = size.tiny)
+    else
+        label.set_xy(bearishSetupScoreLabel, bar_index, high)
+        label.set_text(bearishSetupScoreLabel, "SHORT " + FormatValueOrDash(tradeSetupScore))
 plot(showChartVisuals and showSmartMoneyVisuals and showPreviousDayLevels ? previousDayHigh : na, "Previous Day High", color = color.new(color.blue, 20), linewidth = 1, style = plot.style_linebr)
 plot(showChartVisuals and showSmartMoneyVisuals and showPreviousDayLevels ? previousDayLow : na, "Previous Day Low", color = color.new(color.blue, 20), linewidth = 1, style = plot.style_linebr)
 plot(showChartVisuals and showSmartMoneyVisuals and showPreviousDayLevels ? previousDayClose : na, "Previous Day Close", color = color.new(color.blue, 55), linewidth = 1, style = plot.style_linebr)
