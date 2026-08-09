@@ -1,11 +1,14 @@
 //@version=6
 // XAUUSD Institutional Framework
-// Version: 0.10.0
+// Version: 0.11.0
 //
 // Session and Opening Range engine. Every state mutation happens on confirmed
 // bars, so the engine never uses future values or repainting calculations.
 //
 // Changelog:
+// - 0.11.0: Added M11 configurable confirmed-bar alerts, bounded dynamic
+//           webhook payloads, deterministic event priority, risk-block
+//           transitions, and alert diagnostics.
 // - 0.10.0: Added an M10 consolidated production dashboard with Compact,
 //           Standard, and Detailed layouts, semantic coloring, M2-M9
 //           diagnostics, trade levels, and event-only chart markers.
@@ -39,7 +42,7 @@
 //============================================================================== 
 // 1. STRATEGY DECLARATION
 //============================================================================== 
-strategy("XAUUSD Institutional Framework v0.10.0", "XAUUSD v0.10.0", overlay = true,
+strategy("XAUUSD Institutional Framework v0.11.0", "XAUUSD v0.11.0", overlay = true,
      pyramiding = 0, calc_on_every_tick = false, calc_on_order_fills = false,
      process_orders_on_close = true, initial_capital = 10000, currency = currency.USD,
      default_qty_type = strategy.percent_of_equity, default_qty_value = 1)
@@ -47,7 +50,7 @@ strategy("XAUUSD Institutional Framework v0.10.0", "XAUUSD v0.10.0", overlay = t
 //============================================================================== 
 // 2. CONSTANTS AND ENUMS
 //============================================================================== 
-string STRATEGY_VERSION = "0.10.0"
+string STRATEGY_VERSION = "0.11.0"
 string DASHBOARD_TITLE = "XAUUSD PRODUCTION MONITOR"
 int MILLISECONDS_PER_MINUTE = 60000
 int ATR_LENGTH = 14
@@ -336,6 +339,37 @@ enum DashboardSize
     Normal
     Large
 
+// M11 payload density. Webhook levels share one stable schema version.
+enum AlertDetailLevel
+    Compact
+    Standard
+    Detailed
+
+// M11 event taxonomy for dispatch, diagnostics, and webhook idempotency.
+enum AlertEventType
+    None
+    BreakoutBullish
+    BreakoutBearish
+    BreakoutFailure
+    RetestDetected
+    RetestConfirmed
+    RetestFailure
+    LiquiditySweep
+    FvgCreated
+    SetupQualified
+    RiskApproved
+    RiskBlocked
+    LongEntry
+    ShortEntry
+    TP1
+    TP2
+    BreakevenActivated
+    TrailingActivated
+    TradeExit
+    TradeWin
+    TradeLoss
+    TradeBreakeven
+
 //============================================================================== 
 // 3. INPUTS
 //============================================================================== 
@@ -362,6 +396,7 @@ string GROUP_TRADE_SCORING_VISUALS = "20. Trade Scoring Visuals"
 string GROUP_RISK_MANAGEMENT = "21. M8 — Risk Management"
 string GROUP_TRADE_MANAGEMENT = "22. M9 — Trade Management"
 string GROUP_M10_DASHBOARD = "23. M10 — Dashboard & Visualization"
+string GROUP_M11_ALERTS = "24. M11 — Alerts & Webhooks"
 
 bool enabled = input.bool(true, "Enable strategy", group = GROUP_GENERAL)
 string expectedSymbol = input.string("XAUUSD", "Expected symbol", group = GROUP_GENERAL)
@@ -406,6 +441,23 @@ bool showChartVisuals = input.bool(true, "Show Chart Visuals", group = GROUP_M10
 bool showTradeLevels = input.bool(true, "Show Trade Levels", group = GROUP_M10_DASHBOARD)
 bool showSignalMarkers = input.bool(true, "Show Signal Markers", group = GROUP_M10_DASHBOARD)
 bool showSmartMoneyVisuals = input.bool(true, "Show Smart Money Visuals", group = GROUP_M10_DASHBOARD)
+bool alertsEnabled = input.bool(false, "Enable Alerts", group = GROUP_M11_ALERTS)
+bool webhookMessagesEnabled = input.bool(false, "Enable Webhook Messages", group = GROUP_M11_ALERTS)
+AlertDetailLevel alertDetailLevel = input.enum(AlertDetailLevel.Standard, "Alert Detail Level", group = GROUP_M11_ALERTS)
+bool alertOnBreakout = input.bool(true, "Alert On Breakout", group = GROUP_M11_ALERTS)
+bool alertOnRetest = input.bool(true, "Alert On Retest", group = GROUP_M11_ALERTS)
+bool alertOnSmartMoneyContext = input.bool(false, "Alert On Smart Money Context", group = GROUP_M11_ALERTS)
+bool alertOnQualifiedSetup = input.bool(true, "Alert On Qualified Setup", group = GROUP_M11_ALERTS)
+bool alertOnRiskApproval = input.bool(true, "Alert On Risk Approval", group = GROUP_M11_ALERTS)
+bool alertOnEntry = input.bool(true, "Alert On Entry", group = GROUP_M11_ALERTS)
+bool alertOnTp1 = input.bool(true, "Alert On TP1", group = GROUP_M11_ALERTS)
+bool alertOnTp2 = input.bool(true, "Alert On TP2", group = GROUP_M11_ALERTS)
+bool alertOnBreakeven = input.bool(true, "Alert On Breakeven", group = GROUP_M11_ALERTS)
+bool alertOnTrailingActivation = input.bool(true, "Alert On Trailing Activation", group = GROUP_M11_ALERTS)
+bool alertOnExit = input.bool(true, "Alert On Exit", group = GROUP_M11_ALERTS)
+bool alertOnRiskBlock = input.bool(true, "Alert On Risk Block", group = GROUP_M11_ALERTS)
+string webhookStrategyId = input.string("XAUUSD-Institutional", "Webhook Strategy ID", group = GROUP_M11_ALERTS)
+string webhookAccountTag = input.string("", "Webhook Account Tag", group = GROUP_M11_ALERTS)
 
 bool emaFilterEnabled = input.bool(true, "Enable EMA filter", group = GROUP_TREND)
 int fastEmaLength = input.int(50, "Fast EMA length", minval = 1, group = GROUP_TREND)
@@ -944,6 +996,9 @@ var int sessionExecutedTradeCount = 0
 var int totalExecutedTradeCount = 0
 var float dailyRealizedTradeProfit = 0.0
 var float sessionRealizedTradeProfit = 0.0
+var RiskBlockReason lastAlertRiskBlockReason = RiskBlockReason.None
+var AlertEventType lastAlertEventType = AlertEventType.None
+var int lastAlertBarIndex = na
 var bool priceAbovePDH = false
 var bool priceBelowPDL = false
 var bool priceAbovePWH = false
@@ -1103,6 +1158,44 @@ TradeDirectionColor(series TradeDirection direction) =>
 // Returns a consistent pass/fail color.
 BooleanStatusColor(bool value) =>
     value ? color.lime : color.red
+
+// Converts a string to a JSON-safe quoted value. Webhook URLs and credentials
+// belong in TradingView alert settings; this payload contains metadata only.
+JsonString(string value) =>
+    string escapedValue = str.replace_all(str.replace_all(str.replace_all(str.replace_all(str.replace_all(value, "\\", "\\\\"), "\"", "\\\""), "\n", ""), "\r", ""), "\t", "")
+    "\"" + escapedValue + "\""
+
+// Converts a nullable number to valid JSON without emitting na or NaN text.
+JsonNumber(float value) =>
+    na(value) ? "null" : str.tostring(value, "#.########")
+
+// Returns a stable readable label for each M11 alert event type.
+AlertEventText(series AlertEventType eventType) =>
+    eventType == AlertEventType.BreakoutBullish ? "BREAKOUT_BULLISH" : eventType == AlertEventType.BreakoutBearish ? "BREAKOUT_BEARISH" : eventType == AlertEventType.BreakoutFailure ? "BREAKOUT_FAILURE" : eventType == AlertEventType.RetestDetected ? "RETEST_DETECTED" : eventType == AlertEventType.RetestConfirmed ? "RETEST_CONFIRMED" : eventType == AlertEventType.RetestFailure ? "RETEST_FAILURE" : eventType == AlertEventType.LiquiditySweep ? "LIQUIDITY_SWEEP" : eventType == AlertEventType.FvgCreated ? "FVG_CREATED" : eventType == AlertEventType.SetupQualified ? "SETUP_QUALIFIED" : eventType == AlertEventType.RiskApproved ? "RISK_APPROVED" : eventType == AlertEventType.RiskBlocked ? "RISK_BLOCKED" : eventType == AlertEventType.LongEntry ? "LONG_ENTRY" : eventType == AlertEventType.ShortEntry ? "SHORT_ENTRY" : eventType == AlertEventType.TP1 ? "TP1_HIT" : eventType == AlertEventType.TP2 ? "TP2_HIT" : eventType == AlertEventType.BreakevenActivated ? "BREAKEVEN_ACTIVATED" : eventType == AlertEventType.TrailingActivated ? "TRAILING_ACTIVATED" : eventType == AlertEventType.TradeExit ? "TRADE_EXIT" : eventType == AlertEventType.TradeWin ? "TRADE_WIN" : eventType == AlertEventType.TradeLoss ? "TRADE_LOSS" : eventType == AlertEventType.TradeBreakeven ? "TRADE_BREAKEVEN" : "NONE"
+
+// Returns a downstream webhook action classification for an M11 event.
+AlertActionText(series AlertEventType eventType) =>
+    eventType == AlertEventType.LongEntry or eventType == AlertEventType.ShortEntry ? "entry" : eventType == AlertEventType.TP1 ? "partial_exit" : eventType == AlertEventType.TP2 or eventType == AlertEventType.TradeExit or eventType == AlertEventType.TradeWin or eventType == AlertEventType.TradeLoss or eventType == AlertEventType.TradeBreakeven ? "exit" : eventType == AlertEventType.BreakevenActivated or eventType == AlertEventType.TrailingActivated ? "modify" : eventType == AlertEventType.RiskBlocked ? "blocked" : "signal"
+
+// Builds a compact human-readable M11 alert message.
+BuildCompactAlert(string eventName, string direction, float price) =>
+    syminfo.ticker + " | " + eventName + " | " + direction + " | " + FormatPrice(price)
+
+// Builds a standard human-readable M11 alert message using existing outputs.
+BuildStandardAlert(string eventName, string direction, float price, float score, float entry, float stop, float quantity, float rMultiple, string context) =>
+    syminfo.ticker + " | " + eventName + " | " + direction + " | Price " + FormatPrice(price) + " | Score " + FormatScore(score) + " | Entry " + FormatPrice(entry) + " | Stop " + FormatPrice(stop) + " | Qty " + FormatQuantity(quantity) + " | " + FormatRMultiple(rMultiple) + " | " + context
+
+// Builds a valid compact JSON webhook payload.
+BuildCompactWebhook(string eventId, string eventName, string action, string direction, int timestamp, float price) =>
+    "{\"schema_version\":\"1\",\"strategy\":" + JsonString(webhookStrategyId) + ",\"version\":" + JsonString(STRATEGY_VERSION) + ",\"event_id\":" + JsonString(eventId) + ",\"event\":" + JsonString(eventName) + ",\"action\":" + JsonString(action) + ",\"symbol\":" + JsonString(syminfo.tickerid) + ",\"timeframe\":" + JsonString(timeframe.period) + ",\"timestamp\":" + str.tostring(timestamp) + ",\"direction\":" + JsonString(direction) + ",\"price\":" + JsonNumber(price) + "}"
+
+// Builds a valid standard JSON webhook payload with current execution context.
+BuildStandardWebhook(string eventId, string eventName, string action, string direction, int timestamp, float price, float score, float entry, float stop, float quantity, float riskPercent) =>
+    "{\"schema_version\":\"1\",\"strategy\":" + JsonString(webhookStrategyId) + ",\"version\":" + JsonString(STRATEGY_VERSION) + ",\"event_id\":" + JsonString(eventId) + ",\"event\":" + JsonString(eventName) + ",\"action\":" + JsonString(action) + ",\"symbol\":" + JsonString(syminfo.tickerid) + ",\"timeframe\":" + JsonString(timeframe.period) + ",\"timestamp\":" + str.tostring(timestamp) + ",\"direction\":" + JsonString(direction) + ",\"price\":" + JsonNumber(price) + ",\"score\":" + JsonNumber(score) + ",\"entry\":" + JsonNumber(entry) + ",\"stop\":" + JsonNumber(stop) + ",\"quantity\":" + JsonNumber(quantity) + ",\"risk_pct\":" + JsonNumber(riskPercent) + ",\"account_tag\":" + JsonString(webhookAccountTag) + "}"
+
+// Builds a bounded detailed JSON webhook payload for external idempotent routing.
+BuildDetailedWebhook(string eventId, string eventName, string action, string direction, int timestamp, float price, float score, float entry, float stop, float tp1, float tp2, float quantity, float riskPercent, string setupState, string tradeState, string outcome, string exitReason, string context, float breakoutDistanceAtr, float retestDistanceAtr, float retestPenetrationAtr, float rangeWidth, float riskDistanceAtr, float cashRisk, float rr1, float rr2, float pnl, float rMultiple) =>
+    "{\"schema_version\":\"1\",\"strategy\":" + JsonString(webhookStrategyId) + ",\"version\":" + JsonString(STRATEGY_VERSION) + ",\"event_id\":" + JsonString(eventId) + ",\"event\":" + JsonString(eventName) + ",\"action\":" + JsonString(action) + ",\"symbol\":" + JsonString(syminfo.tickerid) + ",\"timeframe\":" + JsonString(timeframe.period) + ",\"timestamp\":" + str.tostring(timestamp) + ",\"direction\":" + JsonString(direction) + ",\"price\":" + JsonNumber(price) + ",\"score\":" + JsonNumber(score) + ",\"entry\":" + JsonNumber(entry) + ",\"stop\":" + JsonNumber(stop) + ",\"tp1\":" + JsonNumber(tp1) + ",\"tp2\":" + JsonNumber(tp2) + ",\"quantity\":" + JsonNumber(quantity) + ",\"risk_pct\":" + JsonNumber(riskPercent) + ",\"setup_state\":" + JsonString(setupState) + ",\"trade_state\":" + JsonString(tradeState) + ",\"outcome\":" + JsonString(outcome) + ",\"exit_reason\":" + JsonString(exitReason) + ",\"context\":" + JsonString(context) + ",\"breakout_distance_atr\":" + JsonNumber(breakoutDistanceAtr) + ",\"retest_distance_atr\":" + JsonNumber(retestDistanceAtr) + ",\"retest_penetration_atr\":" + JsonNumber(retestPenetrationAtr) + ",\"range_width\":" + JsonNumber(rangeWidth) + ",\"risk_distance_atr\":" + JsonNumber(riskDistanceAtr) + ",\"cash_risk\":" + JsonNumber(cashRisk) + ",\"rr1\":" + JsonNumber(rr1) + ",\"rr2\":" + JsonNumber(rr2) + ",\"pnl\":" + JsonNumber(pnl) + ",\"r_multiple\":" + JsonNumber(rMultiple) + ",\"account_tag\":" + JsonString(webhookAccountTag) + "}"
 
 // Converts the opening-range input selection into an integer minute duration.
 OpeningRangeMinutes() =>
@@ -1578,6 +1671,9 @@ UpdateDashboard() =>
                     SetDashboardRow(dashboard, 68, "Average Trade", strategy.closedtrades > 0 ? FormatCurrency(strategy.netprofit / strategy.closedtrades) : "-")
                     SetDashboardRow(dashboard, 69, "Mandatory Gates", (bullishMandatoryGateDisplay ? "BULL PASS" : "BULL FAIL") + " / " + (bearishMandatoryGateDisplay ? "BEAR PASS" : "BEAR FAIL"))
                     SetDashboardRow(dashboard, 70, "Bull / Bear Penalty", FormatScore(bullishTradePenaltyDisplay) + " / " + FormatScore(bearishTradePenaltyDisplay))
+                    SetDashboardStatusRow(dashboard, 71, "Alerts / Webhook", (alertsEnabled ? "ON" : "OFF") + " / " + (webhookMessagesEnabled ? "ON" : "OFF"), alertsEnabled ? color.lime : color.silver)
+                    SetDashboardRow(dashboard, 72, "Last Alert", AlertEventText(lastAlertEventType))
+                    SetDashboardRow(dashboard, 73, "Last Alert Bar", FormatIntOrDash(lastAlertBarIndex))
         else
             table.clear(dashboard, 0, 0, 1, 95)
 
@@ -3168,6 +3264,100 @@ blockedByConsecutiveLosses := dailyRiskGuardEnabled and not consecutiveLossLimit
 int reconciledRiskBlockCount = (blockedByDailyRisk ? 1 : 0) + (blockedByDailyLoss ? 1 : 0) + (blockedByTradeCount ? 1 : 0) + (blockedByConsecutiveLosses ? 1 : 0) + (blockedBySessionRisk ? 1 : 0)
 riskBlockReason := reconciledRiskBlockCount > 1 ? RiskBlockReason.Multiple : blockedByDailyRisk ? RiskBlockReason.DailyRisk : blockedByDailyLoss ? RiskBlockReason.DailyLoss : blockedByTradeCount ? RiskBlockReason.TradeCount : blockedByConsecutiveLosses ? RiskBlockReason.ConsecutiveLosses : blockedBySessionRisk ? RiskBlockReason.SessionRisk : RiskBlockReason.None
 riskBlockReasonDashboardText := riskBlockReason == RiskBlockReason.DailyRisk ? "Daily Risk" : riskBlockReason == RiskBlockReason.DailyLoss ? "Daily Loss" : riskBlockReason == RiskBlockReason.TradeCount ? "Trade Count" : riskBlockReason == RiskBlockReason.ConsecutiveLosses ? "Consecutive Losses" : riskBlockReason == RiskBlockReason.SessionRisk ? "Session Risk" : riskBlockReason == RiskBlockReason.Multiple ? "Multiple" : "None"
+
+//==============================================================================
+// 29. M11 ALERTS AND WEBHOOK DISPATCH
+//==============================================================================
+// TradingView delivers alerts externally. Any broker bridge must independently
+// validate symbol, direction, quantity, idempotency, and XAUUSD lot conversion.
+// Webhook URLs and credentials are configured in TradingView, never in source.
+bool newRiskBlockTransition = riskBlockReason != RiskBlockReason.None and riskBlockReason != lastAlertRiskBlockReason
+lastAlertRiskBlockReason := riskBlockReason
+AlertEventType selectedAlertEvent = AlertEventType.None
+if barstate.isconfirmed
+    if alertOnExit and tradeClosedEvent
+        selectedAlertEvent := AlertEventType.TradeExit
+    else if alertOnTp2 and tradeTP2HitEvent
+        selectedAlertEvent := AlertEventType.TP2
+    else if alertOnTp1 and tradeTP1HitEvent
+        selectedAlertEvent := AlertEventType.TP1
+    else if alertOnEntry and longPositionOpened
+        selectedAlertEvent := AlertEventType.LongEntry
+    else if alertOnEntry and shortPositionOpened
+        selectedAlertEvent := AlertEventType.ShortEntry
+    else if alertOnBreakeven and breakevenActivatedEvent
+        selectedAlertEvent := AlertEventType.BreakevenActivated
+    else if alertOnTrailingActivation and trailingActivatedEvent
+        selectedAlertEvent := AlertEventType.TrailingActivated
+    else if alertOnRiskApproval and bullishRiskApprovedEvent
+        selectedAlertEvent := AlertEventType.RiskApproved
+    else if alertOnRiskApproval and bearishRiskApprovedEvent
+        selectedAlertEvent := AlertEventType.RiskApproved
+    else if alertOnQualifiedSetup and (bullishTradeQualifiedEvent or bearishTradeQualifiedEvent)
+        selectedAlertEvent := AlertEventType.SetupQualified
+    else if alertOnRetest and (bullishRetestConfirmed or bearishRetestConfirmed)
+        selectedAlertEvent := AlertEventType.RetestConfirmed
+    else if alertOnBreakout and bullishBreakoutSignal
+        selectedAlertEvent := AlertEventType.BreakoutBullish
+    else if alertOnBreakout and bearishBreakoutSignal
+        selectedAlertEvent := AlertEventType.BreakoutBearish
+    else if alertOnRiskBlock and newRiskBlockTransition
+        selectedAlertEvent := AlertEventType.RiskBlocked
+    else if alertOnBreakout and (bullishBreakoutFailure or bearishBreakoutFailure)
+        selectedAlertEvent := AlertEventType.BreakoutFailure
+    else if alertOnRetest and (bullishRetestFailure or bearishRetestFailure)
+        selectedAlertEvent := AlertEventType.RetestFailure
+    else if alertOnRetest and (bullishRetestDetected or bearishRetestDetected)
+        selectedAlertEvent := AlertEventType.RetestDetected
+    else if alertOnSmartMoneyContext and (bullishLiquiditySweep or bearishLiquiditySweep)
+        selectedAlertEvent := AlertEventType.LiquiditySweep
+    else if alertOnSmartMoneyContext and (bullishFvgCreated or bearishFvgCreated)
+        selectedAlertEvent := AlertEventType.FvgCreated
+
+bool selectedAlertIsBreakout = selectedAlertEvent == AlertEventType.BreakoutBullish or selectedAlertEvent == AlertEventType.BreakoutBearish or selectedAlertEvent == AlertEventType.BreakoutFailure
+bool selectedAlertIsRetest = selectedAlertEvent == AlertEventType.RetestDetected or selectedAlertEvent == AlertEventType.RetestConfirmed or selectedAlertEvent == AlertEventType.RetestFailure
+bool selectedAlertIsTradeManagement = selectedAlertEvent == AlertEventType.LongEntry or selectedAlertEvent == AlertEventType.ShortEntry or selectedAlertEvent == AlertEventType.TP1 or selectedAlertEvent == AlertEventType.TP2 or selectedAlertEvent == AlertEventType.BreakevenActivated or selectedAlertEvent == AlertEventType.TrailingActivated or selectedAlertEvent == AlertEventType.TradeExit
+bool selectedAlertLong = selectedAlertEvent == AlertEventType.BreakoutBullish or selectedAlertEvent == AlertEventType.LongEntry or selectedAlertEvent == AlertEventType.SetupQualified and bullishTradeQualifiedEvent or selectedAlertEvent == AlertEventType.RiskApproved and bullishRiskApprovedEvent or selectedAlertIsBreakout and breakoutTradeDirection == TradeDirection.Long or selectedAlertIsRetest and retestTradeDirection == TradeDirection.Long or selectedAlertIsTradeManagement and activeTradeDirection == TradeBias.Bullish or selectedAlertEvent == AlertEventType.TradeExit and lastTradeEntryId == "LONG" or selectedAlertEvent == AlertEventType.LiquiditySweep and bullishLiquiditySweep or selectedAlertEvent == AlertEventType.FvgCreated and bullishFvgCreated
+bool selectedAlertShort = selectedAlertEvent == AlertEventType.BreakoutBearish or selectedAlertEvent == AlertEventType.ShortEntry or selectedAlertEvent == AlertEventType.SetupQualified and bearishTradeQualifiedEvent or selectedAlertEvent == AlertEventType.RiskApproved and bearishRiskApprovedEvent or selectedAlertIsBreakout and breakoutTradeDirection == TradeDirection.Short or selectedAlertIsRetest and retestTradeDirection == TradeDirection.Short or selectedAlertIsTradeManagement and activeTradeDirection == TradeBias.Bearish or selectedAlertEvent == AlertEventType.TradeExit and lastTradeEntryId == "SHORT" or selectedAlertEvent == AlertEventType.LiquiditySweep and bearishLiquiditySweep or selectedAlertEvent == AlertEventType.FvgCreated and bearishFvgCreated
+string selectedAlertDirection = selectedAlertLong ? "LONG" : selectedAlertShort ? "SHORT" : "NONE"
+float selectedAlertPrice = selectedAlertIsBreakout ? breakoutPrice : selectedAlertIsRetest ? retestLevel : selectedAlertEvent == AlertEventType.LiquiditySweep ? sweptLevel : selectedAlertEvent == AlertEventType.FvgCreated ? (bullishFvgCreated ? latestBullishFvgMid : latestBearishFvgMid) : selectedAlertEvent == AlertEventType.RiskApproved ? riskEntryPrice : selectedAlertEvent == AlertEventType.LongEntry or selectedAlertEvent == AlertEventType.ShortEntry ? not na(tradeActualEntry) ? tradeActualEntry : tradePlannedEntry : selectedAlertEvent == AlertEventType.TP1 ? tradeTP1 : selectedAlertEvent == AlertEventType.TP2 ? tradeTP2 : selectedAlertEvent == AlertEventType.BreakevenActivated or selectedAlertEvent == AlertEventType.TrailingActivated ? tradeEffectiveStop : selectedAlertEvent == AlertEventType.TradeExit ? lastTradeExitPrice : close
+float selectedAlertScore = selectedAlertIsBreakout ? breakoutScore : selectedAlertIsRetest ? retestScore : selectedAlertEvent == AlertEventType.SetupQualified ? tradeSetupScore : selectedAlertEvent == AlertEventType.RiskApproved ? tradeSetupScore : na
+float selectedAlertEntry = selectedAlertEvent == AlertEventType.TradeExit ? lastTradeEntryPrice : not na(tradeActualEntry) ? tradeActualEntry : not na(tradePlannedEntry) ? tradePlannedEntry : riskEntryPrice
+float selectedAlertStop = tradeActive and not na(tradeEffectiveStop) ? tradeEffectiveStop : not na(riskStopPrice) ? riskStopPrice : tradeInitialStop
+float selectedAlertQuantity = selectedAlertEvent == AlertEventType.TradeExit ? tradeInitialQuantity : tradeActive and not na(tradeRemainingQuantity) ? tradeRemainingQuantity : not na(riskQuantity) ? riskQuantity : na
+float selectedAlertRiskPercent = riskActualPercent
+float selectedAlertPnl = selectedAlertEvent == AlertEventType.TradeExit ? lastTradeProfit : na
+float selectedAlertRMultiple = selectedAlertEvent == AlertEventType.TradeExit ? lastTradeRMultiple : na
+float selectedAlertBreakoutDistanceAtr = selectedAlertIsBreakout ? breakoutDistanceATR : na
+float selectedAlertRetestDistanceAtr = selectedAlertIsRetest ? retestDistanceATR : na
+float selectedAlertRetestPenetrationAtr = selectedAlertIsRetest ? retestPenetrationATR : na
+float selectedAlertRangeWidth = selectedAlertIsBreakout ? rangeState.width : na
+bool selectedAlertUsesRisk = selectedAlertEvent == AlertEventType.RiskApproved or selectedAlertIsTradeManagement
+float selectedAlertRiskDistanceAtr = selectedAlertUsesRisk ? riskDistanceATR : na
+float selectedAlertCashRisk = selectedAlertUsesRisk ? riskCashAmount : na
+float selectedAlertRr1 = selectedAlertUsesRisk ? riskRR1 : na
+float selectedAlertRr2 = selectedAlertUsesRisk ? riskRR2 : na
+
+if alertsEnabled and selectedAlertEvent != AlertEventType.None
+    string selectedAlertSetupState = tradeSetupState == TradeSetupState.BullishQualified ? "Bullish Qualified" : tradeSetupState == TradeSetupState.BearishQualified ? "Bearish Qualified" : tradeSetupState == TradeSetupState.Conflict ? "Conflict" : tradeSetupState == TradeSetupState.Disqualified ? "Disqualified" : tradeSetupState == TradeSetupState.Expired ? "Expired" : "None"
+    string selectedAlertTradeState = tradeActive ? "Active" : "Flat"
+    string selectedAlertOutcome = selectedAlertEvent == AlertEventType.TradeExit ? TradeOutcomeText(lastTradeOutcome) : "None"
+    string selectedAlertExitContext = selectedAlertEvent == AlertEventType.RiskBlocked ? riskBlockReasonDashboardText : TradeExitReasonText(lastTradeExitReason)
+    string selectedAlertSessionText = sessionState.currentSession == SessionName.Asia ? "Asia" : sessionState.currentSession == SessionName.London ? "London" : sessionState.currentSession == SessionName.NewYork ? "New York" : sessionState.currentSession == SessionName.Custom ? "Custom" : "None"
+    string selectedAlertSetupStrength = tradeSetupStrength == TradeSetupStrength.Extreme ? "Extreme" : tradeSetupStrength == TradeSetupStrength.Strong ? "Strong" : tradeSetupStrength == TradeSetupStrength.Normal ? "Normal" : "Weak"
+    string selectedAlertContext = selectedAlertIsBreakout ? "Strength " + BreakoutStrengthText(breakoutStrength) + " | Distance " + FormatAtrMultiple(breakoutDistanceATR) + " | Range " + FormatPrice(rangeState.width) + " | Session " + selectedAlertSessionText : selectedAlertIsRetest ? "Distance " + FormatAtrMultiple(retestDistanceATR) + " | Penetration " + FormatAtrMultiple(retestPenetrationATR) + " | State " + RetestStateText(retestState) : selectedAlertEvent == AlertEventType.SetupQualified ? "Strength " + selectedAlertSetupStrength + " | Raw " + FormatScore(selectedAlertLong ? bullishTradeScoreRaw : bearishTradeScoreRaw) + " | Adjusted " + FormatScore(tradeSetupScore) + " | SMC " + FormatScore(selectedAlertLong ? bullishSmartMoneyScore : bearishSmartMoneyScore) : selectedAlertEvent == AlertEventType.RiskApproved ? "Risk " + FormatAtrMultiple(riskDistanceATR) + " | Cash " + FormatCurrency(riskCashAmount) + " | RR " + FormatRMultiple(riskRR1) + " / " + FormatRMultiple(riskRR2) : selectedAlertEvent == AlertEventType.TP1 ? "Remaining Qty " + FormatQuantity(tradeRemainingQuantity) + " | Breakeven " + (breakevenActivated ? "ON" : "OFF") : selectedAlertEvent == AlertEventType.TP2 ? "Target 2 filled; final P/L awaits close reconciliation" : selectedAlertEvent == AlertEventType.BreakevenActivated ? "BE Stop " + FormatPrice(tradeEffectiveStop) + " | Remaining Qty " + FormatQuantity(tradeRemainingQuantity) : selectedAlertEvent == AlertEventType.TrailingActivated ? "Trailing Stop " + FormatPrice(tradeEffectiveStop) + " | Remaining Qty " + FormatQuantity(tradeRemainingQuantity) : selectedAlertEvent == AlertEventType.TradeExit ? "Outcome " + selectedAlertOutcome + " | " + selectedAlertExitContext + " | P/L " + FormatCurrency(selectedAlertPnl) + " | " + FormatRMultiple(selectedAlertRMultiple) : selectedAlertEvent == AlertEventType.RiskBlocked ? riskBlockReasonDashboardText : selectedAlertEvent == AlertEventType.LiquiditySweep ? "Source " + LiquiditySourceText(sweepSource) + " | Distance " + FormatAtrMultiple(sweepDistanceATR) : selectedAlertEvent == AlertEventType.FvgCreated ? "FVG midpoint " + FormatPrice(selectedAlertPrice) : ""
+    string selectedAlertName = AlertEventText(selectedAlertEvent)
+    string selectedAlertAction = AlertActionText(selectedAlertEvent)
+    string selectedAlertId = webhookStrategyId + "|" + syminfo.tickerid + "|" + timeframe.period + "|" + str.tostring(bar_index) + "|" + selectedAlertName
+    string configuredAlertMessage = webhookMessagesEnabled ? alertDetailLevel == AlertDetailLevel.Compact ? BuildCompactWebhook(selectedAlertId, selectedAlertName, selectedAlertAction, selectedAlertDirection, time_close, selectedAlertPrice) : alertDetailLevel == AlertDetailLevel.Standard ? BuildStandardWebhook(selectedAlertId, selectedAlertName, selectedAlertAction, selectedAlertDirection, time_close, selectedAlertPrice, selectedAlertScore, selectedAlertEntry, selectedAlertStop, selectedAlertQuantity, selectedAlertRiskPercent) : BuildDetailedWebhook(selectedAlertId, selectedAlertName, selectedAlertAction, selectedAlertDirection, time_close, selectedAlertPrice, selectedAlertScore, selectedAlertEntry, selectedAlertStop, tradeTP1, tradeTP2, selectedAlertQuantity, selectedAlertRiskPercent, selectedAlertSetupState, selectedAlertTradeState, selectedAlertOutcome, selectedAlertExitContext, selectedAlertContext, selectedAlertBreakoutDistanceAtr, selectedAlertRetestDistanceAtr, selectedAlertRetestPenetrationAtr, selectedAlertRangeWidth, selectedAlertRiskDistanceAtr, selectedAlertCashRisk, selectedAlertRr1, selectedAlertRr2, selectedAlertPnl, selectedAlertRMultiple) : alertDetailLevel == AlertDetailLevel.Compact ? BuildCompactAlert(selectedAlertName, selectedAlertDirection, selectedAlertPrice) : BuildStandardAlert(selectedAlertName, selectedAlertDirection, selectedAlertPrice, selectedAlertScore, selectedAlertEntry, selectedAlertStop, selectedAlertQuantity, selectedAlertRMultiple, selectedAlertContext)
+    alert(configuredAlertMessage, alert.freq_once_per_bar_close)
+    lastAlertEventType := selectedAlertEvent
+    lastAlertBarIndex := bar_index
+
+// alertcondition() is deliberately not used: TradingView strategies cannot
+// expose alertcondition triggers. The confirmed-bar alert() dispatcher above
+// supplies the dynamic strategy trigger, while strategy order fills remain
+// available through TradingView's native strategy-alert configuration.
 
 // Dashboard text is formed in the main execution scope. This prevents Pine
 // from coercing series enum values to const parameters through UpdateDashboard.
