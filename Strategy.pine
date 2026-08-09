@@ -437,6 +437,7 @@ bool showRangeLines = input.bool(true, "Draw high, low, and mid", group = GROUP_
 bool showRangeLabels = input.bool(true, "Draw range labels", group = GROUP_VISUALS)
 
 bool debugEnabled = input.bool(false, "Show debug panel", group = GROUP_DASHBOARD)
+bool signalFunnelDebugEnabled = input.bool(false, "Enable Signal Funnel Debug", group = GROUP_DASHBOARD)
 bool showDashboard = input.bool(true, "Show Dashboard", group = GROUP_M10_DASHBOARD)
 DashboardPosition dashboardPosition = input.enum(DashboardPosition.TopRight, "Dashboard Position", group = GROUP_M10_DASHBOARD)
 DashboardSize dashboardSize = input.enum(DashboardSize.Normal, "Dashboard Size", group = GROUP_M10_DASHBOARD)
@@ -1013,6 +1014,50 @@ var float sessionRealizedTradeProfit = 0.0
 var RiskBlockReason lastAlertRiskBlockReason = RiskBlockReason.None
 var AlertEventType lastAlertEventType = AlertEventType.None
 var int lastAlertBarIndex = na
+
+// M12 signal-funnel diagnostics. These counters are intentionally independent
+// of M2-M11 state ownership and increment only from confirmed one-bar events
+// or false-to-true gate transitions. They never influence a trading decision.
+var int debugOrValidCount = 0
+var int debugBullRawBreakoutCount = 0
+var int debugBearRawBreakoutCount = 0
+var int debugBullAcceptedBreakoutCount = 0
+var int debugBearAcceptedBreakoutCount = 0
+var int debugBullRetestDetectedCount = 0
+var int debugBearRetestDetectedCount = 0
+var int debugBullRetestConfirmedCount = 0
+var int debugBearRetestConfirmedCount = 0
+var int debugBullMandatoryGateCount = 0
+var int debugBearMandatoryGateCount = 0
+var int debugBullScoreThresholdCount = 0
+var int debugBearScoreThresholdCount = 0
+var int debugBullQualificationCandidateCount = 0
+var int debugBearQualificationCandidateCount = 0
+var int debugBullSetupQualifiedCount = 0
+var int debugBearSetupQualifiedCount = 0
+var int debugBullRiskContextCount = 0
+var int debugBearRiskContextCount = 0
+var int debugBaseRiskApprovalCount = 0
+var int debugFinalRiskApprovalCount = 0
+var int debugBullRiskApprovalEventCount = 0
+var int debugBearRiskApprovalEventCount = 0
+var int debugLongEntryAllowedCount = 0
+var int debugShortEntryAllowedCount = 0
+var int debugLongEntrySubmissionCount = 0
+var int debugShortEntrySubmissionCount = 0
+var bool debugPreviousOrValid = false
+var bool debugPreviousBullRawBreakout = false
+var bool debugPreviousBearRawBreakout = false
+var bool debugPreviousBullMandatoryGate = false
+var bool debugPreviousBearMandatoryGate = false
+var bool debugPreviousBullScoreThreshold = false
+var bool debugPreviousBearScoreThreshold = false
+var bool debugPreviousBullQualificationCandidate = false
+var bool debugPreviousBearQualificationCandidate = false
+var bool debugPreviousBaseRiskApproval = false
+var bool debugPreviousFinalRiskApproval = false
+var bool debugPreviousLongEntryAllowed = false
+var bool debugPreviousShortEntryAllowed = false
 var bool priceAbovePDH = false
 var bool priceBelowPDL = false
 var bool priceAbovePWH = false
@@ -1581,6 +1626,7 @@ CalculateTrendLabel(label previousLabel) =>
 //============================================================================== 
 var table dashboard = table.new(DashboardTablePosition(), 2, 96, border_width = 1)
 var table debugTable = table.new(position.bottom_right, 2, 6, border_width = 1)
+var table signalFunnelTable = table.new(position.middle_left, 6, 30, border_width = 1)
 
 // Writes one consistently styled M10 dashboard row.
 SetDashboardRow(table target, int row, string caption, string value) =>
@@ -1596,6 +1642,25 @@ SetDashboardStatusRow(table target, int row, string caption, string value, color
 SetDashboardSection(table target, int row, string caption) =>
     table.cell(target, 0, row, "[ " + caption + " ]", text_color = color.aqua, bgcolor = color.new(color.navy, 25), text_size = DashboardTextSize())
     table.cell(target, 1, row, "", text_color = color.aqua, bgcolor = color.new(color.navy, 25), text_size = DashboardTextSize())
+
+// Formats a current diagnostic gate without influencing the gate itself.
+SignalFunnelStatus(bool value) =>
+    value ? "PASS" : "FAIL"
+
+// Writes one event/transition count in the separate M12 signal-funnel table.
+SetSignalFunnelStageRow(table target, int row, string caption, int count) =>
+    table.cell(target, 0, row, caption, text_color = color.silver, bgcolor = color.new(color.black, 15), text_size = size.tiny)
+    table.cell(target, 1, row, str.tostring(count), text_color = color.white, bgcolor = color.new(color.black, 65), text_size = size.tiny)
+
+// Writes one paired M7 gate diagnostic without changing its scoring behavior.
+SetSignalFunnelGateRow(table target, int row, string caption, bool bullishValue, bool bearishValue) =>
+    table.cell(target, 2, row, caption, text_color = color.silver, bgcolor = color.new(color.black, 15), text_size = size.tiny)
+    table.cell(target, 3, row, SignalFunnelStatus(bullishValue), text_color = BooleanStatusColor(bullishValue), bgcolor = color.new(color.black, 65), text_size = size.tiny)
+    table.cell(target, 4, row, SignalFunnelStatus(bearishValue), text_color = BooleanStatusColor(bearishValue), bgcolor = color.new(color.black, 65), text_size = size.tiny)
+
+// Writes one M8/M9 current-state diagnostic in the final table column.
+SetSignalFunnelStatusRow(table target, int row, string caption, bool value) =>
+    table.cell(target, 5, row, caption + ": " + SignalFunnelStatus(value), text_color = BooleanStatusColor(value), bgcolor = color.new(color.black, 65), text_size = size.tiny)
 
 // Updates the fixed-capacity M10 dashboard only on the last chart bar.
 UpdateDashboard() =>
@@ -2979,12 +3044,82 @@ bool longStopAndTargetValid = not na(riskEntryPrice) and not na(riskStopPrice) a
 bool shortStopAndTargetValid = not na(riskEntryPrice) and not na(riskStopPrice) and riskStopPrice > riskEntryPrice and (not useTp1 or not na(riskTP1) and riskEntryPrice > riskTP1) and (not useTp2 or not na(riskTP2) and riskEntryPrice > riskTP2) and (not (useTp1 and useTp2) or riskTP1 > riskTP2)
 bool longEntryAllowed = tradeExecutionEnabled and entryModeSupported and allowLongTrades and not dualRiskApprovalEvent and bullishRiskApprovedEvent and riskApproved and bullishRiskApproved and riskDirection == TradeBias.Bullish and not na(riskQuantity) and riskQuantity > 0.0 and longStopAndTargetValid and targetAllocationValid and onePositionGatePass
 bool shortEntryAllowed = tradeExecutionEnabled and entryModeSupported and allowShortTrades and not dualRiskApprovalEvent and bearishRiskApprovedEvent and riskApproved and bearishRiskApproved and riskDirection == TradeBias.Bearish and not na(riskQuantity) and riskQuantity > 0.0 and shortStopAndTargetValid and targetAllocationValid and onePositionGatePass
+bool debugM9StopTargetOrderingValid = longStopAndTargetValid or shortStopAndTargetValid
+
+// Count only confirmed event edges. Persistent gates are counted when they
+// first turn true, so the table measures funnel progression rather than bars.
+if signalFunnelDebugEnabled and barstate.isconfirmed
+    if rangeState.isComplete and rangeState.qualityAccepted and not debugPreviousOrValid
+        debugOrValidCount += 1
+    if bullishBreakoutCandidate and not debugPreviousBullRawBreakout
+        debugBullRawBreakoutCount += 1
+    if bearishBreakoutCandidate and not debugPreviousBearRawBreakout
+        debugBearRawBreakoutCount += 1
+    if bullishBreakoutSignal
+        debugBullAcceptedBreakoutCount += 1
+    if bearishBreakoutSignal
+        debugBearAcceptedBreakoutCount += 1
+    if bullishRetestDetected
+        debugBullRetestDetectedCount += 1
+    if bearishRetestDetected
+        debugBearRetestDetectedCount += 1
+    if bullishRetestConfirmed
+        debugBullRetestConfirmedCount += 1
+    if bearishRetestConfirmed
+        debugBearRetestConfirmedCount += 1
+    if bullishMandatoryGatePass and not debugPreviousBullMandatoryGate
+        debugBullMandatoryGateCount += 1
+    if bearishMandatoryGatePass and not debugPreviousBearMandatoryGate
+        debugBearMandatoryGateCount += 1
+    if bullishScoreThresholdPass and not debugPreviousBullScoreThreshold
+        debugBullScoreThresholdCount += 1
+    if bearishScoreThresholdPass and not debugPreviousBearScoreThreshold
+        debugBearScoreThresholdCount += 1
+    if bullishTradeQualificationCandidate and not debugPreviousBullQualificationCandidate
+        debugBullQualificationCandidateCount += 1
+    if bearishTradeQualificationCandidate and not debugPreviousBearQualificationCandidate
+        debugBearQualificationCandidateCount += 1
+    if bullishTradeQualifiedEvent
+        debugBullSetupQualifiedCount += 1
+    if bearishTradeQualifiedEvent
+        debugBearSetupQualifiedCount += 1
+    if newBullishRiskContext
+        debugBullRiskContextCount += 1
+    if newBearishRiskContext
+        debugBearRiskContextCount += 1
+    if baseRiskApproved and not debugPreviousBaseRiskApproval
+        debugBaseRiskApprovalCount += 1
+    if riskApproved and not debugPreviousFinalRiskApproval
+        debugFinalRiskApprovalCount += 1
+    if bullishRiskApprovedEvent
+        debugBullRiskApprovalEventCount += 1
+    if bearishRiskApprovedEvent
+        debugBearRiskApprovalEventCount += 1
+    if longEntryAllowed and not debugPreviousLongEntryAllowed
+        debugLongEntryAllowedCount += 1
+    if shortEntryAllowed and not debugPreviousShortEntryAllowed
+        debugShortEntryAllowedCount += 1
+    debugPreviousOrValid := rangeState.isComplete and rangeState.qualityAccepted
+    debugPreviousBullRawBreakout := bullishBreakoutCandidate
+    debugPreviousBearRawBreakout := bearishBreakoutCandidate
+    debugPreviousBullMandatoryGate := bullishMandatoryGatePass
+    debugPreviousBearMandatoryGate := bearishMandatoryGatePass
+    debugPreviousBullScoreThreshold := bullishScoreThresholdPass
+    debugPreviousBearScoreThreshold := bearishScoreThresholdPass
+    debugPreviousBullQualificationCandidate := bullishTradeQualificationCandidate
+    debugPreviousBearQualificationCandidate := bearishTradeQualificationCandidate
+    debugPreviousBaseRiskApproval := baseRiskApproved
+    debugPreviousFinalRiskApproval := riskApproved
+    debugPreviousLongEntryAllowed := longEntryAllowed
+    debugPreviousShortEntryAllowed := shortEntryAllowed
 
 if cancelPendingSetupOnSessionEnd and sessionState.justEnded and strategy.position_size == 0.0
     strategy.cancel("LONG")
     strategy.cancel("SHORT")
 if longEntryAllowed
     strategy.entry("LONG", strategy.long, qty = riskQuantity)
+    if signalFunnelDebugEnabled and barstate.isconfirmed
+        debugLongEntrySubmissionCount += 1
     if useTp1 and useTp2
         strategy.exit("L-TP1", from_entry = "LONG", stop = riskStopPrice, limit = riskTP1, qty_percent = tp1QuantityPercent)
         strategy.exit("L-TP2", from_entry = "LONG", stop = riskStopPrice, limit = riskTP2, qty_percent = tp2QuantityPercent)
@@ -3005,6 +3140,8 @@ if longEntryAllowed
     activeTradeDirection := TradeBias.Bullish
 else if shortEntryAllowed
     strategy.entry("SHORT", strategy.short, qty = riskQuantity)
+    if signalFunnelDebugEnabled and barstate.isconfirmed
+        debugShortEntrySubmissionCount += 1
     if useTp1 and useTp2
         strategy.exit("S-TP1", from_entry = "SHORT", stop = riskStopPrice, limit = riskTP1, qty_percent = tp1QuantityPercent)
         strategy.exit("S-TP2", from_entry = "SHORT", stop = riskStopPrice, limit = riskTP2, qty_percent = tp2QuantityPercent)
@@ -3415,6 +3552,82 @@ trendLabel := CalculateTrendLabel(trendLabel)
 UpdateRangeDrawings()
 UpdateDashboard()
 UpdateDebugPanel()
+
+// M12 signal funnel. It is a separate, opt-in table so the production
+// dashboard layout and all M2-M11 decisions remain untouched.
+if barstate.islast
+    if signalFunnelDebugEnabled
+        table.clear(signalFunnelTable, 0, 0, 5, 29)
+        table.cell(signalFunnelTable, 0, 0, "SIGNAL FUNNEL", text_color = color.aqua, bgcolor = color.new(color.navy, 25), text_size = size.tiny)
+        table.cell(signalFunnelTable, 1, 0, "COUNT", text_color = color.aqua, bgcolor = color.new(color.navy, 25), text_size = size.tiny)
+        table.cell(signalFunnelTable, 2, 0, "M7 GATE", text_color = color.aqua, bgcolor = color.new(color.navy, 25), text_size = size.tiny)
+        table.cell(signalFunnelTable, 3, 0, "BULL", text_color = color.aqua, bgcolor = color.new(color.navy, 25), text_size = size.tiny)
+        table.cell(signalFunnelTable, 4, 0, "BEAR", text_color = color.aqua, bgcolor = color.new(color.navy, 25), text_size = size.tiny)
+        table.cell(signalFunnelTable, 5, 0, "M8 / M9", text_color = color.aqua, bgcolor = color.new(color.navy, 25), text_size = size.tiny)
+        table.cell(signalFunnelTable, 0, 1, "Trade Execution", text_color = color.silver, bgcolor = color.new(color.black, 15), text_size = size.tiny)
+        table.cell(signalFunnelTable, 1, 1, tradeExecutionEnabled ? "ENABLED" : "BLOCKED - ENABLE M9 EXECUTION", text_color = tradeExecutionEnabled ? color.lime : color.red, bgcolor = color.new(color.black, 65), text_size = size.tiny)
+        SetSignalFunnelStageRow(signalFunnelTable, 2, "Valid OR", debugOrValidCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 3, "Bull raw BO", debugBullRawBreakoutCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 4, "Bear raw BO", debugBearRawBreakoutCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 5, "Bull accepted BO", debugBullAcceptedBreakoutCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 6, "Bear accepted BO", debugBearAcceptedBreakoutCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 7, "Bull retest detected", debugBullRetestDetectedCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 8, "Bear retest detected", debugBearRetestDetectedCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 9, "Bull retest confirmed", debugBullRetestConfirmedCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 10, "Bear retest confirmed", debugBearRetestConfirmedCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 11, "Bull M7 gates", debugBullMandatoryGateCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 12, "Bear M7 gates", debugBearMandatoryGateCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 13, "Bull score pass", debugBullScoreThresholdCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 14, "Bear score pass", debugBearScoreThresholdCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 15, "Bull M7 candidate", debugBullQualificationCandidateCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 16, "Bear M7 candidate", debugBearQualificationCandidateCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 17, "Bull setup qualified", debugBullSetupQualifiedCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 18, "Bear setup qualified", debugBearSetupQualifiedCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 19, "Bull M8 context", debugBullRiskContextCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 20, "Bear M8 context", debugBearRiskContextCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 21, "M8 base approval", debugBaseRiskApprovalCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 22, "M8 final approval", debugFinalRiskApprovalCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 23, "Bull risk event", debugBullRiskApprovalEventCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 24, "Bear risk event", debugBearRiskApprovalEventCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 25, "longEntryAllowed", debugLongEntryAllowedCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 26, "shortEntryAllowed", debugShortEntryAllowedCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 27, "LONG submitted", debugLongEntrySubmissionCount)
+        SetSignalFunnelStageRow(signalFunnelTable, 28, "SHORT submitted", debugShortEntrySubmissionCount)
+        SetSignalFunnelGateRow(signalFunnelTable, 1, "Session", bullishSessionGate, bearishSessionGate)
+        SetSignalFunnelGateRow(signalFunnelTable, 2, "Breakout", bullishBreakoutGate, bearishBreakoutGate)
+        SetSignalFunnelGateRow(signalFunnelTable, 3, "Retest", bullishRetestGate, bearishRetestGate)
+        SetSignalFunnelGateRow(signalFunnelTable, 4, "Trend", bullishTrendGate, bearishTrendGate)
+        SetSignalFunnelGateRow(signalFunnelTable, 5, "Smart Money", bullishSmartMoneyGate, bearishSmartMoneyGate)
+        SetSignalFunnelGateRow(signalFunnelTable, 6, "Components", bullishComponentMinimumsPass, bearishComponentMinimumsPass)
+        table.cell(signalFunnelTable, 2, 7, "Hard DQ", text_color = color.silver, bgcolor = color.new(color.black, 15), text_size = size.tiny)
+        table.cell(signalFunnelTable, 3, 7, bullishHardDisqualified ? "YES" : "NO", text_color = bullishHardDisqualified ? color.red : color.lime, bgcolor = color.new(color.black, 65), text_size = size.tiny)
+        table.cell(signalFunnelTable, 4, 7, bearishHardDisqualified ? "YES" : "NO", text_color = bearishHardDisqualified ? color.red : color.lime, bgcolor = color.new(color.black, 65), text_size = size.tiny)
+        SetSignalFunnelGateRow(signalFunnelTable, 8, "Score Threshold", bullishScoreThresholdPass, bearishScoreThresholdPass)
+        SetSignalFunnelStatusRow(signalFunnelTable, 1, "M8 Context", riskContextActive)
+        SetSignalFunnelStatusRow(signalFunnelTable, 2, "M8 Stop Valid", proposedStopValid)
+        SetSignalFunnelStatusRow(signalFunnelTable, 3, "M8 Stop Distance", stopDistanceValid)
+        SetSignalFunnelStatusRow(signalFunnelTable, 4, "M8 Sizing", positionSizingValid)
+        SetSignalFunnelStatusRow(signalFunnelTable, 5, "M8 Risk Limit", positionRiskWithinLimit)
+        SetSignalFunnelStatusRow(signalFunnelTable, 6, "M8 Targets", riskTargetsValid)
+        SetSignalFunnelStatusRow(signalFunnelTable, 7, "M8 RR", requiredRrValidationPass)
+        SetSignalFunnelStatusRow(signalFunnelTable, 8, "M8 Base Approval", baseRiskApproved)
+        SetSignalFunnelStatusRow(signalFunnelTable, 9, "M8 Daily Guard", dailyRiskBudgetAvailable and dailyLossLimitPass)
+        SetSignalFunnelStatusRow(signalFunnelTable, 10, "M8 Session Guard", sessionRiskBudgetAvailable)
+        SetSignalFunnelStatusRow(signalFunnelTable, 11, "M8 Trade Count", dailyTradeCountPass)
+        SetSignalFunnelStatusRow(signalFunnelTable, 12, "M8 Loss Guard", consecutiveLossLimitPass)
+        SetSignalFunnelStatusRow(signalFunnelTable, 13, "M8 Final Approval", riskApproved)
+        SetSignalFunnelStatusRow(signalFunnelTable, 14, "M9 Execution", tradeExecutionEnabled)
+        SetSignalFunnelStatusRow(signalFunnelTable, 15, "M9 Long Allowed", longEntryAllowed)
+        SetSignalFunnelStatusRow(signalFunnelTable, 16, "M9 Short Allowed", shortEntryAllowed)
+        SetSignalFunnelStatusRow(signalFunnelTable, 17, "M9 Risk Event", bullishRiskApprovedEvent or bearishRiskApprovedEvent)
+        SetSignalFunnelStatusRow(signalFunnelTable, 18, "M9 Quantity", not na(riskQuantity) and riskQuantity > 0.0)
+        SetSignalFunnelStatusRow(signalFunnelTable, 19, "M9 TP Allocation", targetAllocationValid)
+        SetSignalFunnelStatusRow(signalFunnelTable, 20, "M9 Stop/Target", debugM9StopTargetOrderingValid)
+        SetSignalFunnelStatusRow(signalFunnelTable, 21, "M9 Flat Gate", onePositionGatePass)
+        SetSignalFunnelStatusRow(signalFunnelTable, 22, "M9 longEntryAllowed", longEntryAllowed)
+        SetSignalFunnelStatusRow(signalFunnelTable, 23, "M9 shortEntryAllowed", shortEntryAllowed)
+    else
+        table.clear(signalFunnelTable, 0, 0, 5, 29)
 
 plot(showChartVisuals and showEmaPlots ? fastEmaValue : na, "Fast EMA", color = color.teal, linewidth = 2)
 plot(showChartVisuals and showEmaPlots ? slowEmaValue : na, "Slow EMA", color = color.orange, linewidth = 2)
