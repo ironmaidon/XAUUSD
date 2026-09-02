@@ -8,3 +8,5 @@ __pycache__/
 *.db
 dist/
 runtime/
+node_modules/
+*.tsbuildinfo
