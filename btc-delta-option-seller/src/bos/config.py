@@ -86,6 +86,24 @@ class RegimeSettings(BaseModel):
     extreme_move_atr_multiple: float = Field(default=2.5, gt=0)
 
 
+class StrikeSelectionSettings(BaseModel):
+    target_delta: float = Field(default=0.20, gt=0, lt=1)
+    minimum_delta: float = Field(default=0.17, gt=0, lt=1)
+    maximum_delta: float = Field(default=0.23, gt=0, lt=1)
+    expected_move_distance: float = Field(default=0.90, gt=0)
+    swing_atr_buffer: float = Field(default=0.25, ge=0)
+    wing_expected_move_multiplier: float = Field(default=0.35, gt=0)
+    minimum_wing_width: float = Field(default=3000, gt=0)
+    maximum_wing_width: float = Field(default=5000, gt=0)
+
+
+class LiquiditySettings(BaseModel):
+    short_max_width_pct: float = Field(default=0.08, gt=0)
+    wing_max_width_pct: float = Field(default=0.15, gt=0)
+    top_book_multiple: float = Field(default=2.0, ge=1)
+    max_book_participation: float = Field(default=0.20, gt=0, le=1)
+
+
 class LiveSettings(BaseModel):
     live_trading: bool = False
 
@@ -106,6 +124,8 @@ class Settings(BaseSettings):
     historical: HistoricalSettings = Field(default_factory=HistoricalSettings)
     volatility: VolatilitySettings = Field(default_factory=VolatilitySettings)
     regime: RegimeSettings = Field(default_factory=RegimeSettings)
+    strike_selection: StrikeSelectionSettings = Field(default_factory=StrikeSelectionSettings)
+    liquidity: LiquiditySettings = Field(default_factory=LiquiditySettings)
     live: LiveSettings = Field(default_factory=LiveSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     armed: bool = False

@@ -11,3 +11,7 @@ The 4H indicator snapshot contains EMA20, EMA50, Wilder ATR14, Wilder ADX14, 20-
 ## M4 regime engine
 
 Extreme conditions have priority over every tradeable classification. ADX above 35, a consistently measured absolute 24-hour move above 2.5 ATR, or a volatility-shock signal produces `EXTREME → NO_TRADE`. Clean trend rules map bullish to a bull put spread and bearish to a bear call spread. Low-ADX, compressed, flat-slope conditions map to `NEUTRAL → IRON_CONDOR`; everything else is explicitly `AMBIGUOUS → NO_TRADE`. Decisions include machine-readable reasons.
+
+## M5 structures
+
+Short selection is constrained to the configured delta zone and must also clear expected-move and buffered swing boundaries. Protective wings must be outward, within configured widths, and are always the first legs in the immutable structure. Credits use executable short bid minus long ask and modeled costs. Vertical and condor maximum loss use defined wing width minus net credit. Stale, crossed, zero, wide, or inadequately sized top-of-book markets fail with explicit reasons.

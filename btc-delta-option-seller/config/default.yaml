@@ -27,6 +27,20 @@ regime:
   flat_slope_threshold: 0.0005
   extreme_adx: 35
   extreme_move_atr_multiple: 2.5
+strike_selection:
+  target_delta: 0.20
+  minimum_delta: 0.17
+  maximum_delta: 0.23
+  expected_move_distance: 0.90
+  swing_atr_buffer: 0.25
+  wing_expected_move_multiplier: 0.35
+  minimum_wing_width: 3000
+  maximum_wing_width: 5000
+liquidity:
+  short_max_width_pct: 0.08
+  wing_max_width_pct: 0.15
+  top_book_multiple: 2.0
+  max_book_participation: 0.20
 live:
   live_trading: false
 logging:
