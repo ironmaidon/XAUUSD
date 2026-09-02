@@ -16,6 +16,16 @@ class ApiEnvelope(BaseModel, Generic[T]):
     meta: dict[str, Any] | None = None
 
 
+class Candle(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    time: int
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal | None = None
+
+
 class Product(BaseModel):
     model_config = ConfigDict(extra="allow")
     id: int

@@ -45,6 +45,26 @@ class DeltaRestClient:
         json_body: Any | None = None,
         authenticated: bool = False,
     ) -> Any:
+        envelope = await self.request_envelope(
+            method,
+            path,
+            response_type,
+            params=params,
+            json_body=json_body,
+            authenticated=authenticated,
+        )
+        return envelope.result
+
+    async def request_envelope(
+        self,
+        method: str,
+        path: str,
+        response_type: Any,
+        *,
+        params: Mapping[str, Any] | None = None,
+        json_body: Any | None = None,
+        authenticated: bool = False,
+    ) -> ApiEnvelope[Any]:
         query = canonical_query(params)
         body = canonical_json(json_body)
         headers: dict[str, str] = {}
@@ -78,4 +98,4 @@ class DeltaRestClient:
                 str(error.get("code", "unknown")),
                 str(error.get("message", response.reason_phrase)),
             )
-        return TypeAdapter(ApiEnvelope[response_type]).validate_python(payload).result
+        return TypeAdapter(ApiEnvelope[response_type]).validate_python(payload)

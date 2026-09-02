@@ -8,3 +8,4 @@ Four modes share future strategy/risk code. Only market-data and execution provi
 
 Transport objects own connection lifecycles. The public WebSocket reconnects with bounded exponential backoff and restores subscriptions. Private stream subscription/reconciliation, order execution, database persistence, heartbeat policy, and trading remain later milestones.
 
+M2 adds normalized candle/product persistence through SQLAlchemy, using SQLite locally and portable ORM types for later PostgreSQL migration. Raw history is also written as compressed Parquet with embedded provenance and quality metadata. Download manifests provide an audit trail independent of the data files.

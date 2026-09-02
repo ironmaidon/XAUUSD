@@ -60,6 +60,13 @@ class MarketDataSettings(BaseModel):
     max_quote_age_seconds: float = Field(default=5, gt=0)
 
 
+class HistoricalSettings(BaseModel):
+    database_url: str = "sqlite:///runtime/bos.db"
+    parquet_root: Path = Path("runtime/parquet")
+    candle_page_limit: int = Field(default=2000, ge=1, le=2000)
+    product_page_size: int = Field(default=100, ge=1, le=1000)
+
+
 class LiveSettings(BaseModel):
     live_trading: bool = False
 
@@ -77,6 +84,7 @@ class Settings(BaseSettings):
     mode: Mode = Mode.PAPER
     exchange: ExchangeSettings = Field(default_factory=ExchangeSettings)
     market_data: MarketDataSettings = Field(default_factory=MarketDataSettings)
+    historical: HistoricalSettings = Field(default_factory=HistoricalSettings)
     live: LiveSettings = Field(default_factory=LiveSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     armed: bool = False

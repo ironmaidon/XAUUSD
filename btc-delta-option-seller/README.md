@@ -1,6 +1,6 @@
 # BTC Delta Exchange Option Seller V1
 
-Safety-first BTC options platform, currently implementing milestones M0–M1 only. It cannot place orders: `DeltaOrderService` deliberately exposes no submission method. Defaults are `PAPER`, live trading false, and disarmed on every startup.
+Safety-first BTC options platform. M0–M2 provide the exchange transports, historical downloader, SQLAlchemy store, and Parquet archive. It cannot place orders: `DeltaOrderService` deliberately exposes no submission method. Defaults are `PAPER`, live trading false, and disarmed on every startup.
 
 ## Setup
 
@@ -11,6 +11,7 @@ python -m venv .venv
 .venv\Scripts\ruff check .
 .venv\Scripts\mypy src
 .venv\Scripts\bos verify-public --config config/default.yaml
+.venv\Scripts\bos verify-history --config config/default.yaml
 ```
 
 Credentials are optional for public M1 verification and are read only from `DELTA_API_KEY` and `DELTA_API_SECRET`. Never commit `.env`.

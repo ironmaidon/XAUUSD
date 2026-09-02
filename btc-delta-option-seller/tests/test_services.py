@@ -34,5 +34,5 @@ async def test_option_chain_keeps_only_btc_options() -> None:
     products.list_tickers.assert_awaited_once_with(
         contract_types="call_options,put_options",
         underlying_asset_symbols="BTC",
-        expiry_date="2026-09-10",
+        expiry_date="10-09-2026",
     )

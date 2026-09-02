@@ -31,4 +31,3 @@ def sign_rest(
 
 def sign_websocket(secret: str, timestamp: str) -> str:
     return sign_rest(secret, "GET", timestamp, "/live")
-

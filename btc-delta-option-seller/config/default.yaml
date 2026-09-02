@@ -7,9 +7,13 @@ exchange:
   reconnect_max_seconds: 30
 market_data:
   max_quote_age_seconds: 5
+historical:
+  database_url: sqlite:///runtime/bos.db
+  parquet_root: runtime/parquet
+  candle_page_limit: 2000
+  product_page_size: 100
 live:
   live_trading: false
 logging:
   level: INFO
   json: true
-

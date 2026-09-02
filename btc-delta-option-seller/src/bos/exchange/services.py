@@ -40,7 +40,7 @@ class DeltaOptionChainService:
             "underlying_asset_symbols": "BTC",
         }
         if expiry:
-            filters["expiry_date"] = expiry.isoformat()
+            filters["expiry_date"] = expiry.strftime("%d-%m-%Y")
         tickers = await self.products.list_tickers(**filters)
         product_list = await self.products.list_products()
         by_symbol = {
