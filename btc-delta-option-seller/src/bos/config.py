@@ -67,6 +67,25 @@ class HistoricalSettings(BaseModel):
     product_page_size: int = Field(default=100, ge=1, le=1000)
 
 
+class VolatilitySettings(BaseModel):
+    rv_window: int = Field(default=20, ge=2)
+    annualization_days: int = Field(default=365, ge=1)
+    iv_percentile_days: int = Field(default=180, ge=1)
+    vrp_minimum: float = Field(default=1.15, gt=0)
+    iv_shock_points: float = Field(default=15.0, gt=0)
+    term_ratio_stress: float = Field(default=1.25, gt=0)
+
+
+class RegimeSettings(BaseModel):
+    directional_adx_min: float = Field(default=18, ge=0)
+    directional_adx_max: float = Field(default=35, gt=0)
+    neutral_adx_max: float = Field(default=22, gt=0)
+    neutral_ema_atr_ratio: float = Field(default=0.60, gt=0)
+    flat_slope_threshold: float = Field(default=0.0005, ge=0)
+    extreme_adx: float = Field(default=35, gt=0)
+    extreme_move_atr_multiple: float = Field(default=2.5, gt=0)
+
+
 class LiveSettings(BaseModel):
     live_trading: bool = False
 
@@ -85,6 +104,8 @@ class Settings(BaseSettings):
     exchange: ExchangeSettings = Field(default_factory=ExchangeSettings)
     market_data: MarketDataSettings = Field(default_factory=MarketDataSettings)
     historical: HistoricalSettings = Field(default_factory=HistoricalSettings)
+    volatility: VolatilitySettings = Field(default_factory=VolatilitySettings)
+    regime: RegimeSettings = Field(default_factory=RegimeSettings)
     live: LiveSettings = Field(default_factory=LiveSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     armed: bool = False

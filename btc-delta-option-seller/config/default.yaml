@@ -12,6 +12,21 @@ historical:
   parquet_root: runtime/parquet
   candle_page_limit: 2000
   product_page_size: 100
+volatility:
+  rv_window: 20
+  annualization_days: 365
+  iv_percentile_days: 180
+  vrp_minimum: 1.15
+  iv_shock_points: 15
+  term_ratio_stress: 1.25
+regime:
+  directional_adx_min: 18
+  directional_adx_max: 35
+  neutral_adx_max: 22
+  neutral_ema_atr_ratio: 0.60
+  flat_slope_threshold: 0.0005
+  extreme_adx: 35
+  extreme_move_atr_multiple: 2.5
 live:
   live_trading: false
 logging:
