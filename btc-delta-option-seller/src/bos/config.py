@@ -139,6 +139,13 @@ class ResearchSettings(BaseModel):
     drawdown_threshold: float = Field(default=0.12, gt=0, lt=1)
 
 
+class PaperSettings(BaseModel):
+    latency_ms: int = Field(default=250, ge=0)
+    slippage_bps: float = Field(default=5, ge=0)
+    max_book_participation: float = Field(default=0.20, gt=0, le=1)
+    reject_stale_after_seconds: float = Field(default=5, gt=0)
+
+
 class LiveSettings(BaseModel):
     live_trading: bool = False
 
@@ -164,6 +171,7 @@ class Settings(BaseSettings):
     risk: RiskSettings = Field(default_factory=RiskSettings)
     backtest: BacktestSettings = Field(default_factory=BacktestSettings)
     research: ResearchSettings = Field(default_factory=ResearchSettings)
+    paper: PaperSettings = Field(default_factory=PaperSettings)
     live: LiveSettings = Field(default_factory=LiveSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     armed: bool = False

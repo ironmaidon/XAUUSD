@@ -70,6 +70,11 @@ research:
   monte_carlo_simulations: 10000
   monte_carlo_seed: 7
   drawdown_threshold: 0.12
+paper:
+  latency_ms: 250
+  slippage_bps: 5
+  max_book_participation: 0.20
+  reject_stale_after_seconds: 5
 live:
   live_trading: false
 logging:
