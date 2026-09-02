@@ -1,0 +1,15 @@
+mode: PAPER
+exchange:
+  environment: production
+  request_timeout_seconds: 10
+  user_agent: btc-delta-option-seller/0.1.0
+  reconnect_initial_seconds: 1
+  reconnect_max_seconds: 30
+market_data:
+  max_quote_age_seconds: 5
+live:
+  live_trading: false
+logging:
+  level: INFO
+  json: true
+
