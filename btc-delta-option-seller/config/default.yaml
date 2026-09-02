@@ -62,6 +62,14 @@ backtest:
   delta_mandatory_exit: 0.35
   delta_emergency_exit: 0.40
   time_exit_hours: 30
+research:
+  train_size: 365
+  validation_size: 90
+  test_size: 90
+  step_size: 90
+  monte_carlo_simulations: 10000
+  monte_carlo_seed: 7
+  drawdown_threshold: 0.12
 live:
   live_trading: false
 logging:

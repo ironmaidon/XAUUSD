@@ -129,6 +129,16 @@ class BacktestSettings(BaseModel):
     time_exit_hours: float = Field(default=30, ge=24, le=36)
 
 
+class ResearchSettings(BaseModel):
+    train_size: int = Field(default=365, ge=1)
+    validation_size: int = Field(default=90, ge=1)
+    test_size: int = Field(default=90, ge=1)
+    step_size: int = Field(default=90, ge=1)
+    monte_carlo_simulations: int = Field(default=10_000, ge=100)
+    monte_carlo_seed: int = 7
+    drawdown_threshold: float = Field(default=0.12, gt=0, lt=1)
+
+
 class LiveSettings(BaseModel):
     live_trading: bool = False
 
@@ -153,6 +163,7 @@ class Settings(BaseSettings):
     liquidity: LiquiditySettings = Field(default_factory=LiquiditySettings)
     risk: RiskSettings = Field(default_factory=RiskSettings)
     backtest: BacktestSettings = Field(default_factory=BacktestSettings)
+    research: ResearchSettings = Field(default_factory=ResearchSettings)
     live: LiveSettings = Field(default_factory=LiveSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     armed: bool = False

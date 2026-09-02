@@ -13,3 +13,11 @@ Entries and exits are valued from executable top-of-book prices plus configured 
 Exit priority is emergency delta, mandatory delta, time exit, premium stop, then profit target. Time exits use the actual expiry timestamp. Portfolio evaluation applies daily and weekly realized-loss limits, maximum drawdown, consecutive-stop latching, and the single-structure constraint. A missing exit quote is not replaced with an entry mark: the result is labeled `ESTIMATED` and conservatively charged the complete defined maximum loss.
 
 Every result reports the percentage of input frames in each data-quality class. A trade spanning unlike quality classes is labeled `RECONSTRUCTED`.
+
+## M8 walk-forward and Monte Carlo
+
+Walk-forward folds contain separate rolling training, validation, and out-of-sample slices. Candidate parameters are ranked using the training slice only. The selected parameters are then evaluated—without reselection—on validation and out-of-sample observations. Reports include every fold's selected parameters and scores, mean validation/OOS scores, and the fraction of positive OOS folds. The splitter refuses incomplete folds and never optimizes over the complete dataset.
+
+Parameter-stability analysis works over arbitrary grids, including short delta, VRP, IV percentile, DTE, expected-move multiplier, wing width, profit target, delta stop, and premium stop. Each point is compared with immediately adjacent values along one dimension at a time. A profitable point whose available neighbors all lose is explicitly flagged as isolated and unstable.
+
+Monte Carlo bootstraps the historical trade-PnL distribution with replacement using a local seeded random generator. It reports the median equity path, fifth-percentile ending equity, median ending equity, 95th-percentile maximum drawdown, probability of breaching the configured drawdown, and median/95th/max consecutive-loss streaks. These are distributional research estimates, not forecasts or profitability promises.
