@@ -50,6 +50,18 @@ risk:
   drawdown_kill_switch: 0.08
   consecutive_full_stop_limit: 3
   maximum_structures: 1
+backtest:
+  initial_equity: 1000000
+  slippage_bps: 5
+  option_fee_rate: 0.0003
+  gst_rate: 0.18
+  settlement_fee_rate: 0
+  partial_fill_ratio: 1.0
+  profit_capture: 0.55
+  premium_stop_multiple: 2.0
+  delta_mandatory_exit: 0.35
+  delta_emergency_exit: 0.40
+  time_exit_hours: 30
 live:
   live_trading: false
 logging:

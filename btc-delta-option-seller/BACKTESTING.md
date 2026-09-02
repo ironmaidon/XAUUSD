@@ -3,3 +3,13 @@
 Historical acquisition begins at M2 and the event-driven backtester at M7. Future results must identify `EXACT`, `RECONSTRUCTED`, and `ESTIMATED` observations, avoid lookahead, and preserve the exact fee/slippage configuration.
 
 The M2 downloader chunks `/v2/history/candles` requests at the documented 2,000-candle limit, deduplicates timestamps, and stores both SQL and Zstandard-compressed Parquet. `MARK:<symbol>` is supported without fabricating unavailable bid/ask or Greeks. Expired BTC options are discovered with cursor pagination and `states=expired,settled`.
+
+## M7 event-driven engine
+
+Market frames must be strictly timestamp-increasing and unique. On each frame, the strategy callback receives only the current frame and the history available through that timestamp. This lets backtests call the same production indicator, volatility, regime, selection, scoring, and risk functions without giving them future observations.
+
+Entries and exits are valued from executable top-of-book prices plus configured basis-point slippage. Multi-leg quantity is capped by the least-liquid leg and one common fill quantity, so a simulated partial fill cannot create naked exposure. Position size uses the production maximum-loss risk function. Entry/exit fees, GST, settlement-fee configuration, and the partial-fill assumption are copied into each result for reproducibility.
+
+Exit priority is emergency delta, mandatory delta, time exit, premium stop, then profit target. Time exits use the actual expiry timestamp. Portfolio evaluation applies daily and weekly realized-loss limits, maximum drawdown, consecutive-stop latching, and the single-structure constraint. A missing exit quote is not replaced with an entry mark: the result is labeled `ESTIMATED` and conservatively charged the complete defined maximum loss.
+
+Every result reports the percentage of input frames in each data-quality class. A trade spanning unlike quality classes is labeled `RECONSTRUCTED`.

@@ -115,6 +115,20 @@ class RiskSettings(BaseModel):
     maximum_structures: int = Field(default=1, ge=1)
 
 
+class BacktestSettings(BaseModel):
+    initial_equity: float = Field(default=1_000_000, gt=0)
+    slippage_bps: float = Field(default=5, ge=0)
+    option_fee_rate: float = Field(default=0.0003, ge=0)
+    gst_rate: float = Field(default=0.18, ge=0)
+    settlement_fee_rate: float = Field(default=0, ge=0)
+    partial_fill_ratio: float = Field(default=1.0, gt=0, le=1)
+    profit_capture: float = Field(default=0.55, gt=0, lt=1)
+    premium_stop_multiple: float = Field(default=2.0, gt=1)
+    delta_mandatory_exit: float = Field(default=0.35, gt=0, lt=1)
+    delta_emergency_exit: float = Field(default=0.40, gt=0, lt=1)
+    time_exit_hours: float = Field(default=30, ge=24, le=36)
+
+
 class LiveSettings(BaseModel):
     live_trading: bool = False
 
@@ -138,6 +152,7 @@ class Settings(BaseSettings):
     strike_selection: StrikeSelectionSettings = Field(default_factory=StrikeSelectionSettings)
     liquidity: LiquiditySettings = Field(default_factory=LiquiditySettings)
     risk: RiskSettings = Field(default_factory=RiskSettings)
+    backtest: BacktestSettings = Field(default_factory=BacktestSettings)
     live: LiveSettings = Field(default_factory=LiveSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     armed: bool = False
