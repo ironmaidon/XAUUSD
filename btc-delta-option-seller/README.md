@@ -1,6 +1,6 @@
 # BTC Delta Exchange Option Seller V1
 
-Safety-first BTC options platform. M0–M2 provide the exchange transports, historical downloader, SQLAlchemy store, and Parquet archive. It cannot place orders: `DeltaOrderService` deliberately exposes no submission method. Defaults are `PAPER`, live trading false, and disarmed on every startup.
+Safety-first BTC options platform. M0–M6 provide exchange transports, historical persistence, volatility/indicator analytics, regime classification, defined-risk structure construction, entry scoring, and portfolio risk sizing. It cannot place orders: `DeltaOrderService` deliberately exposes no submission method. Defaults are `PAPER`, live trading false, and disarmed on every startup.
 
 ## Setup
 

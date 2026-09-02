@@ -41,6 +41,15 @@ liquidity:
   wing_max_width_pct: 0.15
   top_book_multiple: 2.0
   max_book_participation: 0.20
+risk:
+  risk_per_trade: 0.005
+  hard_trade_risk_cap: 0.01
+  total_open_defined_risk: 0.02
+  daily_realized_loss_limit: 0.015
+  weekly_realized_loss_limit: 0.03
+  drawdown_kill_switch: 0.08
+  consecutive_full_stop_limit: 3
+  maximum_structures: 1
 live:
   live_trading: false
 logging:

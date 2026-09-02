@@ -104,6 +104,17 @@ class LiquiditySettings(BaseModel):
     max_book_participation: float = Field(default=0.20, gt=0, le=1)
 
 
+class RiskSettings(BaseModel):
+    risk_per_trade: float = Field(default=0.005, gt=0, le=0.01)
+    hard_trade_risk_cap: float = Field(default=0.01, gt=0, le=0.01)
+    total_open_defined_risk: float = Field(default=0.02, gt=0)
+    daily_realized_loss_limit: float = Field(default=0.015, gt=0)
+    weekly_realized_loss_limit: float = Field(default=0.03, gt=0)
+    drawdown_kill_switch: float = Field(default=0.08, gt=0)
+    consecutive_full_stop_limit: int = Field(default=3, ge=1)
+    maximum_structures: int = Field(default=1, ge=1)
+
+
 class LiveSettings(BaseModel):
     live_trading: bool = False
 
@@ -126,6 +137,7 @@ class Settings(BaseSettings):
     regime: RegimeSettings = Field(default_factory=RegimeSettings)
     strike_selection: StrikeSelectionSettings = Field(default_factory=StrikeSelectionSettings)
     liquidity: LiquiditySettings = Field(default_factory=LiquiditySettings)
+    risk: RiskSettings = Field(default_factory=RiskSettings)
     live: LiveSettings = Field(default_factory=LiveSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     armed: bool = False
