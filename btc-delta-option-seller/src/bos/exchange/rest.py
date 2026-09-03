@@ -19,10 +19,14 @@ class DeltaRestClient:
         self, settings: ExchangeSettings, transport: httpx.AsyncBaseTransport | None = None
     ):
         self.settings = settings
+        # Delta API-key whitelists accept public IPv4 addresses. On dual-stack hosts,
+        # forcing the default transport to IPv4 keeps signed requests on the same
+        # egress address configured in Delta.
+        resolved_transport = transport or httpx.AsyncHTTPTransport(local_address="0.0.0.0")
         self._client = httpx.AsyncClient(
             base_url=settings.rest_url,
             timeout=settings.request_timeout_seconds,
-            transport=transport,
+            transport=resolved_transport,
             headers={"Accept": "application/json", "User-Agent": settings.user_agent},
         )
 

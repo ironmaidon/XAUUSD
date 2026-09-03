@@ -60,3 +60,18 @@ async def test_authenticated_call_without_secrets_fails_before_network() -> None
             await client.request("GET", "/v2/positions", dict, authenticated=True)
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_default_transport_forces_ipv4(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+    real_transport = httpx.AsyncHTTPTransport
+
+    def transport(**kwargs: object) -> httpx.AsyncHTTPTransport:
+        captured.update(kwargs)
+        return real_transport(**kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", transport)
+    client = DeltaRestClient(ExchangeSettings())
+    await client.close()
+    assert captured["local_address"] == "0.0.0.0"
