@@ -22,6 +22,7 @@ from bos.dashboard.state import DashboardState
 from bos.exchange.models import DeltaApiError, Ticker
 from bos.exchange.rest import DeltaRestClient
 from bos.exchange.services import DeltaProductService, DeltaWalletService
+from bos.runtime import PaperTradingRuntime
 
 CredentialValidator = Callable[[ExchangeSettings], Awaitable[None]]
 MarketPriceFetcher = Callable[[ExchangeSettings], Awaitable[float]]
@@ -89,6 +90,7 @@ def create_app(
     app.state.dashboard = dashboard
     app.state.exchange_settings = configured.exchange
     app.state.credentials_connected = False
+    app.state.paper_runtime = None
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -156,6 +158,10 @@ def create_app(
 
         request.app.state.exchange_settings = exchange
         request.app.state.credentials_connected = True
+        existing = request.app.state.paper_runtime
+        if existing is not None:
+            await existing.stop()
+        request.app.state.paper_runtime = PaperTradingRuntime(configured, exchange, dashboard)
         _, current = await read_state(request).get()
         current.status.credentials_connected = True
         await read_state(request).publish(current)
@@ -177,9 +183,22 @@ def create_app(
         current.status.paper_trading_active = True
         current.status.reconciliation_status = "NOT_REQUIRED_PAPER"
         await read_state(request).publish(current)
+        runtime: PaperTradingRuntime | None = request.app.state.paper_runtime
+        if runtime is None:
+            raise HTTPException(
+                status_code=409, detail="Reconnect to Delta before starting paper mode"
+            )
+        runtime.start()
         return PaperTradingView(
-            active=True, message="Paper trading session started; live execution remains disabled"
+            active=True,
+            message="Paper trading engine started; live execution remains disabled",
         )
+
+    @app.on_event("shutdown")
+    async def stop_runtime() -> None:
+        runtime: PaperTradingRuntime | None = app.state.paper_runtime
+        if runtime is not None:
+            await runtime.stop()
 
     def collection_route(field: str) -> Callable[[Request], Awaitable[object]]:
         async def collection(request: Request) -> object:
