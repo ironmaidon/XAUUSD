@@ -19,16 +19,26 @@ from bos.dashboard.models import (
     PaperTradingView,
 )
 from bos.dashboard.state import DashboardState
-from bos.exchange.models import DeltaApiError
+from bos.exchange.models import DeltaApiError, Ticker
 from bos.exchange.rest import DeltaRestClient
-from bos.exchange.services import DeltaWalletService
+from bos.exchange.services import DeltaProductService, DeltaWalletService
 
 CredentialValidator = Callable[[ExchangeSettings], Awaitable[None]]
+MarketPriceFetcher = Callable[[ExchangeSettings], Awaitable[float]]
 
 
 async def validate_credentials(settings: ExchangeSettings) -> None:
     async with DeltaRestClient(settings) as client:
         await DeltaWalletService(client).balances()
+
+
+async def fetch_btc_price(settings: ExchangeSettings) -> float:
+    async with DeltaRestClient(settings) as client:
+        ticker: Ticker = await DeltaProductService(client).get_ticker("BTCUSD")
+    price = ticker.spot_price or ticker.mark_price or ticker.close
+    if price is None or price <= 0:
+        raise ValueError("Delta BTCUSD ticker did not contain a positive price")
+    return float(price)
 
 
 def safe_connection_error(error: Exception, environment: Environment) -> str:
@@ -71,6 +81,7 @@ def create_app(
     settings: Settings | None = None,
     state: DashboardState | None = None,
     credential_validator: CredentialValidator = validate_credentials,
+    market_price_fetcher: MarketPriceFetcher = fetch_btc_price,
 ) -> FastAPI:
     configured = settings or Settings()
     dashboard = state or DashboardState(configured)
@@ -103,6 +114,23 @@ def create_app(
         _, value = await read_state(request).get()
         return value.status
 
+    @app.get("/api/market/btc", response_model=DashboardSnapshot)
+    async def market_btc(request: Request) -> DashboardSnapshot:
+        _, current = await read_state(request).get()
+        try:
+            current.status.btc_price = await market_price_fetcher(
+                request.app.state.exchange_settings
+            )
+            current.status.connection = "CONNECTED"
+        except Exception as error:
+            current.status.connection = "DEGRADED"
+            await read_state(request).publish(current)
+            raise HTTPException(
+                status_code=503, detail="BTCUSD market feed is unavailable"
+            ) from error
+        await read_state(request).publish(current)
+        return current
+
     @app.post("/api/settings/connect", response_model=ConnectionView)
     async def connect(credentials: CredentialRequest, request: Request) -> ConnectionView:
         api_key = credentials.api_key.strip()
@@ -119,7 +147,7 @@ def create_app(
         except Exception as error:
             request.app.state.credentials_connected = False
             _, current = await read_state(request).get()
-            current.status.connection = "DISCONNECTED"
+            current.status.credentials_connected = False
             current.status.paper_trading_active = False
             await read_state(request).publish(current)
             raise HTTPException(
@@ -129,7 +157,7 @@ def create_app(
         request.app.state.exchange_settings = exchange
         request.app.state.credentials_connected = True
         _, current = await read_state(request).get()
-        current.status.connection = "CONNECTED"
+        current.status.credentials_connected = True
         await read_state(request).publish(current)
         return ConnectionView(
             connected=True,

@@ -6,6 +6,12 @@ export async function getSnapshot(signal?: AbortSignal): Promise<Snapshot> {
   return response.json() as Promise<Snapshot>
 }
 
+export async function refreshBtcMarket(signal?: AbortSignal): Promise<Snapshot> {
+  const response = await fetch('/api/market/btc', { signal })
+  if (!response.ok) throw new Error(`BTC market feed returned ${response.status}`)
+  return response.json() as Promise<Snapshot>
+}
+
 type Environment = 'production' | 'testnet'
 
 async function post<T>(path: string, body?: unknown): Promise<T> {

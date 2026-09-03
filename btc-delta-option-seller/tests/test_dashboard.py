@@ -16,6 +16,7 @@ def test_dashboard_defaults_are_paper_and_disarmed() -> None:
     payload = response.json()
     assert payload["status"]["mode"] == "PAPER"
     assert payload["status"]["armed"] is False
+    assert payload["status"]["credentials_connected"] is False
     assert payload["candidate"]["eligible"] is False
 
 
@@ -67,6 +68,7 @@ def test_connect_and_start_paper_trading_without_exposing_credentials() -> None:
     snapshot = client.get("/api/snapshot").json()
     assert snapshot["status"]["mode"] == "PAPER"
     assert snapshot["status"]["armed"] is False
+    assert snapshot["status"]["credentials_connected"] is True
     assert snapshot["status"]["paper_trading_active"] is True
     assert captured
 
@@ -130,3 +132,23 @@ def test_connect_trims_pasted_credentials() -> None:
     exchange = captured[0]
     assert exchange.api_key.get_secret_value() == "key"
     assert exchange.api_secret.get_secret_value() == "secret"
+
+
+def test_btc_market_feed_updates_dashboard_snapshot() -> None:
+    async def price(_exchange: object) -> float:
+        return 111_234.5
+
+    client = TestClient(create_app(Settings(), market_price_fetcher=price))
+    response = client.get("/api/market/btc")
+    assert response.status_code == 200
+    assert response.json()["status"]["btc_price"] == 111_234.5
+    assert response.json()["status"]["connection"] == "CONNECTED"
+
+
+def test_btc_market_feed_failure_is_degraded() -> None:
+    async def unavailable(_exchange: object) -> float:
+        raise TimeoutError
+
+    client = TestClient(create_app(Settings(), market_price_fetcher=unavailable))
+    assert client.get("/api/market/btc").status_code == 503
+    assert client.get("/api/snapshot").json()["status"]["connection"] == "DEGRADED"

@@ -21,6 +21,7 @@ class SystemStatusView(BaseModel):
     mode: Literal["BACKTEST", "REPLAY", "PAPER", "LIVE"] = "PAPER"
     armed: bool = False
     connection: Literal["CONNECTED", "DEGRADED", "DISCONNECTED"] = "DISCONNECTED"
+    credentials_connected: bool = False
     btc_price: float | None = None
     regime: str = "AMBIGUOUS"
     entry_score: float = Field(default=0, ge=0, le=100)

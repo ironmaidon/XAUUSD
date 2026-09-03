@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Activity, BookOpen, CandlestickChart, ClipboardList, FileClock, Gauge, Logs, Settings, ShieldCheck, Wifi, WifiOff } from 'lucide-react'
-import { connectDelta, getSnapshot, startPaperTrading } from './api'
+import { connectDelta, getSnapshot, refreshBtcMarket, startPaperTrading } from './api'
 import type { Snapshot } from './types'
 import { PriceChart } from './PriceChart'
 
@@ -10,7 +10,7 @@ type Route = typeof routes[number]
 const icons = [Activity, BookOpen, CandlestickChart, Gauge, ClipboardList, ShieldCheck, FileClock, Settings, Logs]
 
 const empty: Snapshot = {
-  status: { mode: 'PAPER', armed: false, connection: 'DISCONNECTED', btc_price: null, regime: 'AMBIGUOUS', entry_score: 0, target_expiry: null, dte: null, heartbeat_healthy: false, paper_trading_active: false, reconciliation_status: 'NOT_REQUIRED_PAPER', updated_at: new Date().toISOString(), volatility: { atm_iv: null, rv20: null, vrp: null, iv_percentile: null, skew_25: null, term_ratio: null, iv_change_24h: null, expected_move_usd: null } },
+  status: { mode: 'PAPER', armed: false, connection: 'DISCONNECTED', credentials_connected: false, btc_price: null, regime: 'AMBIGUOUS', entry_score: 0, target_expiry: null, dte: null, heartbeat_healthy: false, paper_trading_active: false, reconciliation_status: 'NOT_REQUIRED_PAPER', updated_at: new Date().toISOString(), volatility: { atm_iv: null, rv20: null, vrp: null, iv_percentile: null, skew_25: null, term_ratio: null, iv_change_24h: null, expected_move_usd: null } },
   candidate: { structure: null, strikes: [], deltas: [], net_credit: null, wing_width: null, credit_ratio: null, max_loss: null, risk_pct: null, quantity: null, entry_score: 0, eligible: false, reasons: ['NO_EVALUATION'], score_components: {} },
   risk: { account_equity_inr: 0, available_funds_inr: 0, trade_risk_pct: 0, open_defined_risk_pct: 0, margin_usage_pct: 0, daily_pnl: 0, weekly_pnl: 0, current_drawdown_pct: 0, maximum_drawdown_pct: 0, consecutive_losses: 0, kill_switches: [] },
   option_chain: [], positions: [], orders: [], fills: [], backtests: [], logs: [], candles: [],
@@ -71,7 +71,7 @@ function SettingsPage({ data, onSnapshot }: { data: Snapshot; onSnapshot: (value
   const [apiSecret, setApiSecret] = useState('')
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState('Credentials are kept in server memory only and are cleared on restart.')
-  const connected = data.status.connection === 'CONNECTED'
+  const connected = data.status.credentials_connected
 
   async function connect() {
     setBusy(true)
@@ -99,6 +99,17 @@ function App() {
   const [data, setData] = useState<Snapshot>(empty)
   const [error, setError] = useState(false)
   useEffect(() => { const controller = new AbortController(); getSnapshot(controller.signal).then(value => { setData(value); setError(false) }).catch(() => setError(true)); return () => controller.abort() }, [])
+  useEffect(() => {
+    const controller = new AbortController()
+    const refresh = () => refreshBtcMarket(controller.signal)
+      .then(value => { setData(value); setError(false) })
+      .catch(() => getSnapshot(controller.signal)
+        .then(value => { setData(value); setError(false) })
+        .catch(() => setError(true)))
+    refresh()
+    const interval = window.setInterval(refresh, 3000)
+    return () => { controller.abort(); window.clearInterval(interval) }
+  }, [])
   const content = useMemo(() => {
     if (route === 'Overview') return <Overview data={data} />
     if (route === 'Risk') return <RiskPage data={data} />

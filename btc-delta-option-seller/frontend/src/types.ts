@@ -7,7 +7,7 @@ export type Volatility = {
 export type Snapshot = {
   status: {
     mode: 'BACKTEST' | 'REPLAY' | 'PAPER' | 'LIVE'; armed: boolean
-    connection: 'CONNECTED' | 'DEGRADED' | 'DISCONNECTED'; btc_price: number | null
+    connection: 'CONNECTED' | 'DEGRADED' | 'DISCONNECTED'; credentials_connected: boolean; btc_price: number | null
     regime: string; entry_score: number; target_expiry: string | null; dte: number | null
     heartbeat_healthy: boolean; paper_trading_active: boolean; reconciliation_status: string; volatility: Volatility
     updated_at: string
