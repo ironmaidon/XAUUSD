@@ -27,6 +27,7 @@ class SystemStatusView(BaseModel):
     target_expiry: datetime | None = None
     dte: float | None = None
     heartbeat_healthy: bool = False
+    paper_trading_active: bool = False
     reconciliation_status: str = "NOT_REQUIRED_PAPER"
     volatility: VolatilityView = Field(default_factory=VolatilityView)
     updated_at: datetime
@@ -73,3 +74,20 @@ class DashboardSnapshot(BaseModel):
     backtests: list[dict[str, Any]] = Field(default_factory=list)
     logs: list[dict[str, Any]] = Field(default_factory=list)
     candles: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class CredentialRequest(BaseModel):
+    environment: Literal["production", "testnet"] = "production"
+    api_key: str = Field(min_length=1, max_length=512)
+    api_secret: str = Field(min_length=1, max_length=512)
+
+
+class ConnectionView(BaseModel):
+    connected: bool
+    environment: Literal["production", "testnet"]
+    message: str
+
+
+class PaperTradingView(BaseModel):
+    active: bool
+    message: str

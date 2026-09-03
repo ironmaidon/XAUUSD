@@ -43,3 +43,34 @@ def test_websocket_sends_snapshot() -> None:
 def test_unknown_api_route_is_not_hidden_by_dashboard_fallback() -> None:
     client = TestClient(create_app(Settings()))
     assert client.get("/api/does-not-exist").status_code == 404
+
+
+def test_connect_and_start_paper_trading_without_exposing_credentials() -> None:
+    captured = []
+
+    async def validate(exchange: object) -> None:
+        captured.append(exchange)
+
+    client = TestClient(create_app(Settings(), credential_validator=validate))
+    response = client.post(
+        "/api/settings/connect",
+        json={"environment": "testnet", "api_key": "key-value", "api_secret": "secret-value"},
+    )
+    assert response.status_code == 200
+    assert response.json()["connected"] is True
+    assert "key-value" not in response.text
+    assert "secret-value" not in response.text
+
+    started = client.post("/api/paper/start")
+    assert started.status_code == 200
+    snapshot = client.get("/api/snapshot").json()
+    assert snapshot["status"]["mode"] == "PAPER"
+    assert snapshot["status"]["armed"] is False
+    assert snapshot["status"]["paper_trading_active"] is True
+    assert captured
+
+
+def test_paper_trading_requires_verified_connection() -> None:
+    client = TestClient(create_app(Settings()))
+    response = client.post("/api/paper/start")
+    assert response.status_code == 409

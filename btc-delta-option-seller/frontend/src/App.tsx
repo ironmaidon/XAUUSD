@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Activity, BookOpen, CandlestickChart, ClipboardList, FileClock, Gauge, Logs, Settings, ShieldCheck, Wifi, WifiOff } from 'lucide-react'
-import { getSnapshot } from './api'
+import { connectDelta, getSnapshot, startPaperTrading } from './api'
 import type { Snapshot } from './types'
 import { PriceChart } from './PriceChart'
 
@@ -10,7 +10,7 @@ type Route = typeof routes[number]
 const icons = [Activity, BookOpen, CandlestickChart, Gauge, ClipboardList, ShieldCheck, FileClock, Settings, Logs]
 
 const empty: Snapshot = {
-  status: { mode: 'PAPER', armed: false, connection: 'DISCONNECTED', btc_price: null, regime: 'AMBIGUOUS', entry_score: 0, target_expiry: null, dte: null, heartbeat_healthy: false, reconciliation_status: 'NOT_REQUIRED_PAPER', updated_at: new Date().toISOString(), volatility: { atm_iv: null, rv20: null, vrp: null, iv_percentile: null, skew_25: null, term_ratio: null, iv_change_24h: null, expected_move_usd: null } },
+  status: { mode: 'PAPER', armed: false, connection: 'DISCONNECTED', btc_price: null, regime: 'AMBIGUOUS', entry_score: 0, target_expiry: null, dte: null, heartbeat_healthy: false, paper_trading_active: false, reconciliation_status: 'NOT_REQUIRED_PAPER', updated_at: new Date().toISOString(), volatility: { atm_iv: null, rv20: null, vrp: null, iv_percentile: null, skew_25: null, term_ratio: null, iv_change_24h: null, expected_move_usd: null } },
   candidate: { structure: null, strikes: [], deltas: [], net_credit: null, wing_width: null, credit_ratio: null, max_loss: null, risk_pct: null, quantity: null, entry_score: 0, eligible: false, reasons: ['NO_EVALUATION'], score_components: {} },
   risk: { account_equity_inr: 0, available_funds_inr: 0, trade_risk_pct: 0, open_defined_risk_pct: 0, margin_usage_pct: 0, daily_pnl: 0, weekly_pnl: 0, current_drawdown_pct: 0, maximum_drawdown_pct: 0, consecutive_losses: 0, kill_switches: [] },
   option_chain: [], positions: [], orders: [], fills: [], backtests: [], logs: [], candles: [],
@@ -65,6 +65,35 @@ function RiskPage({ data }: { data: Snapshot }) {
   return <section className="panel"><header><div><p className="eyebrow">Capital preservation</p><h2>Portfolio risk</h2></div><span className={`decision ${r.kill_switches.length ? 'fail' : 'pass'}`}>{r.kill_switches.length ? 'BREACH' : 'WITHIN LIMITS'}</span></header><div className="metrics risk-grid"><Metric label="Account equity" value={`₹${number(r.account_equity_inr, 0)}`} /><Metric label="Available funds" value={`₹${number(r.available_funds_inr, 0)}`} /><Metric label="Trade risk" value={percent(r.trade_risk_pct)} /><Metric label="Open defined risk" value={percent(r.open_defined_risk_pct)} /><Metric label="Margin usage" value={percent(r.margin_usage_pct)} /><Metric label="Daily P&L" value={`₹${number(r.daily_pnl, 0)}`} /><Metric label="Weekly P&L" value={`₹${number(r.weekly_pnl, 0)}`} /><Metric label="Current drawdown" value={percent(r.current_drawdown_pct)} /><Metric label="Max drawdown" value={percent(r.maximum_drawdown_pct)} /><Metric label="Consecutive losses" value={String(r.consecutive_losses)} /><Metric label="Heartbeat" value={data.status.heartbeat_healthy ? 'HEALTHY' : 'INACTIVE'} tone={data.status.heartbeat_healthy ? 'good' : 'warn'} /><Metric label="Reconciliation" value={data.status.reconciliation_status} /></div></section>
 }
 
+function SettingsPage({ data, onSnapshot }: { data: Snapshot; onSnapshot: (value: Snapshot) => void }) {
+  const [environment, setEnvironment] = useState<'production' | 'testnet'>('production')
+  const [apiKey, setApiKey] = useState('')
+  const [apiSecret, setApiSecret] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState('Credentials are kept in server memory only and are cleared on restart.')
+  const connected = data.status.connection === 'CONNECTED'
+
+  async function connect() {
+    setBusy(true)
+    try {
+      const result = await connectDelta(environment, apiKey.trim(), apiSecret)
+      setApiKey(''); setApiSecret(''); setMessage(result.message)
+      onSnapshot(await getSnapshot())
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Connection failed') }
+    finally { setBusy(false) }
+  }
+
+  async function startPaper() {
+    setBusy(true)
+    try {
+      const result = await startPaperTrading(); setMessage(result.message); onSnapshot(await getSnapshot())
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Could not start paper trading') }
+    finally { setBusy(false) }
+  }
+
+  return <section className="panel settings-panel"><header><div><p className="eyebrow">Session-only configuration</p><h2>Delta Exchange connection</h2></div><span className={`decision ${connected ? 'pass' : 'fail'}`}>{connected ? 'CONNECTED' : 'NOT CONNECTED'}</span></header><div className="settings-form"><label>Environment<select value={environment} onChange={event => setEnvironment(event.target.value as 'production' | 'testnet')} disabled={busy}><option value="production">Delta India production</option><option value="testnet">Delta India testnet</option></select></label><label>API key<input type="password" autoComplete="off" value={apiKey} onChange={event => setApiKey(event.target.value)} placeholder="Enter API key" disabled={busy} /></label><label>API secret<input type="password" autoComplete="off" value={apiSecret} onChange={event => setApiSecret(event.target.value)} placeholder="Enter API secret" disabled={busy} /></label><div className="settings-actions"><button className="primary" onClick={connect} disabled={busy || !apiKey.trim() || !apiSecret}>{busy ? 'Working…' : 'Connect'}</button><button onClick={startPaper} disabled={busy || !connected || data.status.paper_trading_active}>{data.status.paper_trading_active ? 'Paper trading active' : 'Start paper trading'}</button></div></div><div className="notice"><ShieldCheck /> {message} Live orders cannot be armed from this dashboard.</div></section>
+}
+
 function App() {
   const [route, setRoute] = useState<Route>('Overview')
   const [data, setData] = useState<Snapshot>(empty)
@@ -75,7 +104,7 @@ function App() {
     if (route === 'Risk') return <RiskPage data={data} />
     const mapping: Partial<Record<Route, Record<string, unknown>[]>> = { 'Option Chain': data.option_chain, Positions: data.positions, Orders: data.orders, Backtests: data.backtests, Logs: data.logs }
     if (route === 'Strategy') return <section className="panel"><header><div><p className="eyebrow">Signal audit</p><h2>Strategy evaluation</h2></div></header><div className="reason"><span>Current decision</span><strong>{data.candidate.reasons.join(' · ')}</strong></div><div className="score-bars">{Object.entries(data.candidate.score_components).map(([name, score]) => <div key={name}><span>{name.replaceAll('_', ' ')}</span><div><i style={{ width: `${score}%` }} /></div><strong>{number(score)}</strong></div>)}</div></section>
-    if (route === 'Settings') return <section className="panel settings-panel"><header><div><p className="eyebrow">Read-only safety state</p><h2>Runtime settings</h2></div></header><div className="notice"><ShieldCheck /> Live trading cannot be armed from this dashboard. The environment gate, manual confirmation, heartbeat, reconciliation and kill-switch checks are enforced outside the web surface.</div></section>
+    if (route === 'Settings') return <SettingsPage data={data} onSnapshot={setData} />
     return <section className="panel"><header><div><p className="eyebrow">{route}</p><h2>{route}</h2></div><span className="tag">Live updates</span></header><DataTable rows={mapping[route] ?? []} emptyText={`No ${route.toLowerCase()} available`} /></section>
   }, [route, data])
   return <div className="shell"><aside><div className="brand"><span className="brand-mark">Δ</span><div><strong>BTC Option Seller</strong><small>Delta India · V1</small></div></div><nav>{routes.map((item, index) => { const Icon = icons[index]; return <button key={item} className={route === item ? 'active' : ''} onClick={() => setRoute(item)}><Icon size={17} />{item}</button> })}</nav><div className="safety"><ShieldCheck size={18} /><div><strong>Defined risk only</strong><span>Live execution disabled</span></div></div></aside><main><header className="page-head"><div><p className="eyebrow">Operations console</p><h1>{route}</h1></div><div className="connection">{error ? <WifiOff size={16} /> : <Wifi size={16} />}<span>{error ? 'Backend offline' : 'Snapshot connected'}</span><i /></div></header>{error && <div className="api-warning">Dashboard backend is offline. Displaying safe empty state; no actions are available.</div>}{content}<footer>BTC Delta Exchange Option Seller V1 · Research software, not investment advice</footer></main></div>

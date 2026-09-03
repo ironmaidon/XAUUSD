@@ -8,22 +8,43 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import SecretStr
 
-from bos.config import Settings
-from bos.dashboard.models import DashboardSnapshot
+from bos.config import Environment, ExchangeSettings, Settings
+from bos.dashboard.models import (
+    ConnectionView,
+    CredentialRequest,
+    DashboardSnapshot,
+    PaperTradingView,
+)
 from bos.dashboard.state import DashboardState
+from bos.exchange.rest import DeltaRestClient
+from bos.exchange.services import DeltaWalletService
+
+CredentialValidator = Callable[[ExchangeSettings], Awaitable[None]]
 
 
-def create_app(settings: Settings | None = None, state: DashboardState | None = None) -> FastAPI:
+async def validate_credentials(settings: ExchangeSettings) -> None:
+    async with DeltaRestClient(settings) as client:
+        await DeltaWalletService(client).balances()
+
+
+def create_app(
+    settings: Settings | None = None,
+    state: DashboardState | None = None,
+    credential_validator: CredentialValidator = validate_credentials,
+) -> FastAPI:
     configured = settings or Settings()
     dashboard = state or DashboardState(configured)
     app = FastAPI(title="BTC Delta Exchange Option Seller V1", version="0.10.0")
     app.state.dashboard = dashboard
+    app.state.exchange_settings = configured.exchange
+    app.state.credentials_connected = False
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
         allow_credentials=False,
-        allow_methods=["GET"],
+        allow_methods=["GET", "POST"],
         allow_headers=["*"],
     )
 
@@ -43,6 +64,52 @@ def create_app(settings: Settings | None = None, state: DashboardState | None = 
     async def status(request: Request) -> object:
         _, value = await read_state(request).get()
         return value.status
+
+    @app.post("/api/settings/connect", response_model=ConnectionView)
+    async def connect(credentials: CredentialRequest, request: Request) -> ConnectionView:
+        exchange = ExchangeSettings(
+            environment=Environment(credentials.environment),
+            api_key=SecretStr(credentials.api_key),
+            api_secret=SecretStr(credentials.api_secret),
+        )
+        try:
+            await credential_validator(exchange)
+        except Exception as error:
+            request.app.state.credentials_connected = False
+            _, current = await read_state(request).get()
+            current.status.connection = "DISCONNECTED"
+            current.status.paper_trading_active = False
+            await read_state(request).publish(current)
+            raise HTTPException(
+                status_code=400, detail="Delta rejected the credentials or could not be reached"
+            ) from error
+
+        request.app.state.exchange_settings = exchange
+        request.app.state.credentials_connected = True
+        _, current = await read_state(request).get()
+        current.status.connection = "CONNECTED"
+        await read_state(request).publish(current)
+        return ConnectionView(
+            connected=True,
+            environment=credentials.environment,
+            message="Delta credentials verified and held in memory for this process only",
+        )
+
+    @app.post("/api/paper/start", response_model=PaperTradingView)
+    async def start_paper(request: Request) -> PaperTradingView:
+        if not request.app.state.credentials_connected:
+            raise HTTPException(
+                status_code=409, detail="Connect to Delta before starting paper mode"
+            )
+        _, current = await read_state(request).get()
+        current.status.mode = "PAPER"
+        current.status.armed = False
+        current.status.paper_trading_active = True
+        current.status.reconciliation_status = "NOT_REQUIRED_PAPER"
+        await read_state(request).publish(current)
+        return PaperTradingView(
+            active=True, message="Paper trading session started; live execution remains disabled"
+        )
 
     def collection_route(field: str) -> Callable[[Request], Awaitable[object]]:
         async def collection(request: Request) -> object:
