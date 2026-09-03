@@ -4,6 +4,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import cast
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -18,6 +19,7 @@ from bos.dashboard.models import (
     PaperTradingView,
 )
 from bos.dashboard.state import DashboardState
+from bos.exchange.models import DeltaApiError
 from bos.exchange.rest import DeltaRestClient
 from bos.exchange.services import DeltaWalletService
 
@@ -27,6 +29,28 @@ CredentialValidator = Callable[[ExchangeSettings], Awaitable[None]]
 async def validate_credentials(settings: ExchangeSettings) -> None:
     async with DeltaRestClient(settings) as client:
         await DeltaWalletService(client).balances()
+
+
+def safe_connection_error(error: Exception, environment: Environment) -> str:
+    target = "production" if environment is Environment.PRODUCTION else "testnet"
+    if isinstance(error, DeltaApiError):
+        code = error.code.lower().replace("_", "")
+        if "invalidapikey" in code:
+            return f"API key is invalid for the selected {target} environment"
+        if "invalidsignature" in code:
+            return "API secret is incorrect or the request signature was rejected"
+        if "signatureexpired" in code:
+            return "Request signature expired; synchronize the Windows clock and retry"
+        if "ipnotwhitelisted" in code:
+            return "This computer's public IP address is not whitelisted for that API key"
+        if error.status_code == 403:
+            return "The API key does not have permission to read wallet balances"
+        return f"Delta rejected the connection ({error.code})"
+    if isinstance(error, httpx.TimeoutException):
+        return f"Delta {target} timed out; check the network and retry"
+    if isinstance(error, httpx.RequestError):
+        return f"Could not reach Delta {target}; check the network and retry"
+    return "Delta returned an unexpected response while checking the credentials"
 
 
 def create_app(
@@ -67,10 +91,14 @@ def create_app(
 
     @app.post("/api/settings/connect", response_model=ConnectionView)
     async def connect(credentials: CredentialRequest, request: Request) -> ConnectionView:
+        api_key = credentials.api_key.strip()
+        api_secret = credentials.api_secret.strip()
+        if not api_key or not api_secret:
+            raise HTTPException(status_code=422, detail="API key and secret cannot be blank")
         exchange = ExchangeSettings(
             environment=Environment(credentials.environment),
-            api_key=SecretStr(credentials.api_key),
-            api_secret=SecretStr(credentials.api_secret),
+            api_key=SecretStr(api_key),
+            api_secret=SecretStr(api_secret),
         )
         try:
             await credential_validator(exchange)
@@ -81,7 +109,7 @@ def create_app(
             current.status.paper_trading_active = False
             await read_state(request).publish(current)
             raise HTTPException(
-                status_code=400, detail="Delta rejected the credentials or could not be reached"
+                status_code=400, detail=safe_connection_error(error, exchange.environment)
             ) from error
 
         request.app.state.exchange_settings = exchange

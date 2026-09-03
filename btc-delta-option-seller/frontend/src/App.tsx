@@ -76,7 +76,7 @@ function SettingsPage({ data, onSnapshot }: { data: Snapshot; onSnapshot: (value
   async function connect() {
     setBusy(true)
     try {
-      const result = await connectDelta(environment, apiKey.trim(), apiSecret)
+      const result = await connectDelta(environment, apiKey.trim(), apiSecret.trim())
       setApiKey(''); setApiSecret(''); setMessage(result.message)
       onSnapshot(await getSnapshot())
     } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Connection failed') }

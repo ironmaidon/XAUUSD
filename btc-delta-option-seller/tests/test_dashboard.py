@@ -6,6 +6,7 @@ from bos.config import Settings
 from bos.dashboard.app import create_app
 from bos.dashboard.models import DashboardSnapshot, SystemStatusView
 from bos.dashboard.state import DashboardState
+from bos.exchange.models import DeltaApiError
 
 
 def test_dashboard_defaults_are_paper_and_disarmed() -> None:
@@ -74,3 +75,39 @@ def test_paper_trading_requires_verified_connection() -> None:
     client = TestClient(create_app(Settings()))
     response = client.post("/api/paper/start")
     assert response.status_code == 409
+
+
+def test_connect_reports_safe_delta_error_without_secret() -> None:
+    async def reject(_exchange: object) -> None:
+        raise DeltaApiError(401, "InvalidApiKey", "Api Key not found")
+
+    client = TestClient(create_app(Settings(), credential_validator=reject))
+    response = client.post(
+        "/api/settings/connect",
+        json={"environment": "testnet", "api_key": "bad-key", "api_secret": "secret"},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "API key is invalid for the selected testnet environment"
+    assert "bad-key" not in response.text
+    assert "secret" not in response.text
+
+
+def test_connect_trims_pasted_credentials() -> None:
+    captured = []
+
+    async def validate(exchange: object) -> None:
+        captured.append(exchange)
+
+    client = TestClient(create_app(Settings(), credential_validator=validate))
+    response = client.post(
+        "/api/settings/connect",
+        json={
+            "environment": "production",
+            "api_key": " key ",
+            "api_secret": " secret ",
+        },
+    )
+    assert response.status_code == 200
+    exchange = captured[0]
+    assert exchange.api_key.get_secret_value() == "key"
+    assert exchange.api_secret.get_secret_value() == "secret"
