@@ -42,7 +42,21 @@ def safe_connection_error(error: Exception, environment: Environment) -> str:
         if "signatureexpired" in code:
             return "Request signature expired; synchronize the Windows clock and retry"
         if "ipnotwhitelisted" in code:
-            return "This computer's public IP address is not whitelisted for that API key"
+            reported_ip = next(
+                (
+                    word.strip(".,:;()[]")
+                    for word in error.message.split()
+                    if word.strip(".,:;()[]").count(".") == 3
+                    and all(
+                        part.isdigit() and 0 <= int(part) <= 255
+                        for part in word.strip(".,:;()[]").split(".")
+                    )
+                ),
+                None,
+            )
+            if reported_ip:
+                return f"Delta sees public IPv4 {reported_ip}; whitelist that exact address"
+            return "This computer's public IPv4 is not whitelisted for that API key"
         if error.status_code == 403:
             return "The API key does not have permission to read wallet balances"
         return f"Delta rejected the connection ({error.code})"

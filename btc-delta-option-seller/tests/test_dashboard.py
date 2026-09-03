@@ -92,6 +92,25 @@ def test_connect_reports_safe_delta_error_without_secret() -> None:
     assert "secret" not in response.text
 
 
+def test_connect_reports_ip_seen_by_delta() -> None:
+    async def reject(_exchange: object) -> None:
+        raise DeltaApiError(
+            401,
+            "ip_not_whitelisted",
+            "IP address not whitelisted. Your IP: 203.0.113.42",
+        )
+
+    client = TestClient(create_app(Settings(), credential_validator=reject))
+    response = client.post(
+        "/api/settings/connect",
+        json={"environment": "production", "api_key": "key", "api_secret": "secret"},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "Delta sees public IPv4 203.0.113.42; whitelist that exact address"
+    )
+
+
 def test_connect_trims_pasted_credentials() -> None:
     captured = []
 
