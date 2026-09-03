@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -30,10 +31,15 @@ async def reconcile(
     local_position_product_ids: set[int],
 ) -> ReconciliationResult:
     try:
-        wallet = await gateway.wallet()
-        positions = await gateway.positions()
-        orders = await gateway.open_orders()
-        await gateway.recent_fills()
+        results = await asyncio.gather(
+            gateway.wallet(),
+            gateway.positions(),
+            gateway.open_orders(),
+            gateway.recent_fills(),
+        )
+        wallet: list[dict[str, Any]] = results[0]
+        positions: list[dict[str, Any]] = results[1]
+        orders: list[dict[str, Any]] = results[2]
     except Exception as error:
         return ReconciliationResult(
             False, True, False, (f"RECONCILIATION_ERROR:{type(error).__name__}",), (), (), False

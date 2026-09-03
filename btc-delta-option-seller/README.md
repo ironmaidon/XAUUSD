@@ -1,6 +1,6 @@
 # BTC Delta Exchange Option Seller V1
 
-Safety-first BTC options platform. M0–M10 provide exchange transports, historical persistence, production-shared strategy/risk analytics, defined-risk structures, research backtesting, realistic paper execution, and a FastAPI + React operations dashboard. It cannot place real orders: `DeltaOrderService` deliberately exposes no submission method. Defaults are `PAPER`, live trading false, and disarmed on every startup.
+Safety-first BTC options platform implementing M0–M12. It includes exchange transports, historical persistence, shared strategy/risk analytics, defined-risk structures, research backtesting, paper execution, dashboard, recovery controls, and a guarded live limit-order adapter. Defaults are `PAPER`, live trading false, and disarmed on every startup. No HTTP/dashboard arming surface exists.
 
 ## Setup
 

@@ -5,6 +5,7 @@ from typing import cast
 
 from bos.exchange.models import OptionQuote, Product, Ticker
 from bos.exchange.rest import DeltaRestClient
+from bos.execution.models import OrderRequest
 
 
 class DeltaProductService:
@@ -70,6 +71,26 @@ class DeltaOrderService:
             "GET", "/v2/fills", list[dict[str, object]], authenticated=True
         )
         return cast(list[dict[str, object]], result)
+
+    async def place_limit(self, order: OrderRequest) -> dict[str, object]:
+        result = await self.client.request(
+            "POST",
+            "/v2/orders",
+            dict[str, object],
+            json_body={
+                "product_id": order.product_id,
+                "size": order.quantity,
+                "side": order.side.value.lower(),
+                "order_type": "limit_order",
+                "limit_price": str(order.limit_price),
+                "time_in_force": "gtc",
+                "post_only": False,
+                "reduce_only": order.reduce_only,
+                "client_order_id": order.client_order_id,
+            },
+            authenticated=True,
+        )
+        return cast(dict[str, object], result)
 
     async def cancel(self, product_id: int, client_order_id: str) -> dict[str, object]:
         result = await self.client.request(
