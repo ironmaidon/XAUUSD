@@ -5,6 +5,8 @@ import asyncio
 import time
 from pathlib import Path
 
+import uvicorn
+
 from bos.config import load_settings
 from bos.exchange.models import Candle
 from bos.exchange.rest import DeltaRestClient
@@ -38,10 +40,12 @@ async def verify_history(config: Path | None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="bos")
-    parser.add_argument("command", choices=["verify-public", "verify-history"])
+    parser.add_argument("command", choices=["verify-public", "verify-history", "serve-dashboard"])
     parser.add_argument("--config", type=Path)
     args = parser.parse_args()
     if args.command == "verify-public":
         asyncio.run(verify_public(args.config))
     elif args.command == "verify-history":
         asyncio.run(verify_history(args.config))
+    elif args.command == "serve-dashboard":
+        uvicorn.run("bos.dashboard.app:app", host="127.0.0.1", port=8000)

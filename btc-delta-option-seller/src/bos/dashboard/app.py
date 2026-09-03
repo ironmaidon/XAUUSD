@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import cast
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from bos.config import Settings
 from bos.dashboard.models import DashboardSnapshot
@@ -70,6 +73,22 @@ def create_app(settings: Settings | None = None, state: DashboardState | None = 
                 await websocket.send_text(value.model_dump_json())
         except WebSocketDisconnect:
             return
+
+    frontend = (Path(__file__).resolve().parents[3] / "frontend" / "dist").resolve()
+    if frontend.is_dir():
+        assets = frontend / "assets"
+        if assets.is_dir():
+            app.mount("/assets", StaticFiles(directory=assets), name="dashboard-assets")
+
+        @app.get("/{client_path:path}", include_in_schema=False)
+        async def dashboard_client(client_path: str) -> FileResponse:
+            if client_path.startswith("api/"):
+                raise HTTPException(status_code=404)
+
+            requested = (frontend / client_path).resolve()
+            if client_path and requested.is_file() and frontend in requested.parents:
+                return FileResponse(requested)
+            return FileResponse(frontend / "index.html")
 
     return app
 

@@ -14,7 +14,7 @@ python -m venv .venv
 .venv\Scripts\bos verify-history --config config/default.yaml
 ```
 
-Run the dashboard backend with `.venv\Scripts\python -m uvicorn bos.dashboard.app:app --port 8000` and the frontend with `pnpm --dir frontend dev`. The frontend proxies `/api` and `/ws` to the local backend.
+For development, run the backend with `.venv\Scripts\python -m uvicorn bos.dashboard.app:app --port 8000` and the frontend with `pnpm --dir frontend dev`. For a single production-style local URL, run `pnpm --dir frontend build` followed by `.venv\Scripts\bos serve-dashboard`; FastAPI serves the built dashboard and API together at `http://127.0.0.1:8000`.
 
 Credentials are optional for public M1 verification and are read only from `DELTA_API_KEY` and `DELTA_API_SECRET`. Never commit `.env`.
 

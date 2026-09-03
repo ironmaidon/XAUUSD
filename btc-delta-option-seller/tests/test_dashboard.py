@@ -38,3 +38,8 @@ def test_websocket_sends_snapshot() -> None:
         with client.websocket_connect("/ws") as socket:
             payload = socket.receive_json()
             assert payload["status"]["armed"] is False
+
+
+def test_unknown_api_route_is_not_hidden_by_dashboard_fallback() -> None:
+    client = TestClient(create_app(Settings()))
+    assert client.get("/api/does-not-exist").status_code == 404
