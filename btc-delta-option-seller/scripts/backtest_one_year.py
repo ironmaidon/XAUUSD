@@ -5,11 +5,12 @@ import json
 import math
 import statistics
 import time
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from bos.backtest.engine import BacktestEngine, EntryIntent, MarketFrame
-from bos.config import Settings
+from bos.config import BacktestSettings, RiskSettings, Settings, StrikeSelectionSettings
 from bos.data.quality import DataQuality
 from bos.exchange.models import Candle
 from bos.exchange.rest import DeltaRestClient
@@ -114,8 +115,15 @@ def build_frames(source: list[Candle]) -> tuple[list[MarketFrame], dict[datetime
     return frames, indexes
 
 
-def run(source: list[Candle], settings: Settings):
-    frames, indexes = build_frames(source)
+def run(
+    source: list[Candle],
+    settings: Settings,
+    *,
+    frames: list[MarketFrame] | None = None,
+    indexes: dict[datetime, int] | None = None,
+):
+    if frames is None or indexes is None:
+        frames, indexes = build_frames(source)
     highs = [float(item.high) for item in source]
     lows = [float(item.low) for item in source]
     closes = [float(item.close) for item in source]
@@ -194,21 +202,66 @@ async def main() -> None:
     end = int(time.time())
     start = end - 365 * 86400
     source = await candles(settings, start, end)
-    result = run(source, settings)
-    pnls = [trade.net_pnl for trade in result.trades]
-    wins = sum(value > 0 for value in pnls)
+    frames, indexes = build_frames(source)
+
+    scenarios = {
+        "production_safety": settings,
+        "strategy_diagnostic_no_consecutive_stop_latch": settings.model_copy(
+            update={
+                "risk": RiskSettings(
+                    consecutive_full_stop_limit=999,
+                    drawdown_kill_switch=settings.risk.drawdown_kill_switch,
+                )
+            }
+        ),
+        "diagnostic_40pct_profit_capture": settings.model_copy(
+            update={
+                "risk": RiskSettings(consecutive_full_stop_limit=999),
+                "backtest": BacktestSettings(profit_capture=0.40),
+            }
+        ),
+        "diagnostic_conservative_15delta": settings.model_copy(
+            update={
+                "risk": RiskSettings(consecutive_full_stop_limit=999),
+                "strike_selection": StrikeSelectionSettings(
+                    target_delta=0.15,
+                    minimum_delta=0.12,
+                    maximum_delta=0.18,
+                    expected_move_distance=1.0,
+                ),
+            }
+        ),
+    }
+
+    scenario_reports = {}
+    for name, scenario in scenarios.items():
+        result = run(source, scenario, frames=frames, indexes=indexes)
+        pnls = [trade.net_pnl for trade in result.trades]
+        wins = sum(value > 0 for value in pnls)
+        scenario_reports[name] = {
+            "ending_equity": result.ending_equity,
+            "net_pnl": result.ending_equity - result.initial_equity,
+            "return_pct": (result.ending_equity / result.initial_equity - 1) * 100,
+            "trades": len(result.trades),
+            "win_rate_pct": wins / len(pnls) * 100 if pnls else 0,
+            "average_trade": statistics.mean(pnls) if pnls else 0,
+            "exit_reasons": dict(Counter(trade.exit_reason.value for trade in result.trades)),
+            "rejection_reasons": dict(Counter(result.rejected_entries)),
+        }
+    result = run(source, settings, frames=frames, indexes=indexes)
+    baseline = scenario_reports["production_safety"]
     report = {
         "period_start": datetime.fromtimestamp(start, UTC).isoformat(),
         "period_end": datetime.fromtimestamp(end, UTC).isoformat(),
         "candle_count": len(source),
         "data_quality": "ESTIMATED_OPTIONS_REAL_UNDERLYING",
         "initial_equity": result.initial_equity,
-        "ending_equity": result.ending_equity,
-        "net_pnl": result.ending_equity - result.initial_equity,
-        "return_pct": (result.ending_equity / result.initial_equity - 1) * 100,
-        "trades": len(result.trades),
-        "win_rate_pct": wins / len(pnls) * 100 if pnls else 0,
-        "average_trade": statistics.mean(pnls) if pnls else 0,
+        "ending_equity": baseline["ending_equity"],
+        "net_pnl": baseline["net_pnl"],
+        "return_pct": baseline["return_pct"],
+        "trades": baseline["trades"],
+        "win_rate_pct": baseline["win_rate_pct"],
+        "average_trade": baseline["average_trade"],
         "maximum_drawdown_pct": max(
             (result.initial_equity - point.equity) / result.initial_equity * 100
             for point in result.equity_curve
@@ -221,6 +274,7 @@ async def main() -> None:
         },
         "rejected_entries": len(result.rejected_entries),
         "fees": result.fee_configuration,
+        "scenario_comparison": scenario_reports,
     }
     output = Path("reports/backtest-one-year.json")
     output.parent.mkdir(exist_ok=True)
