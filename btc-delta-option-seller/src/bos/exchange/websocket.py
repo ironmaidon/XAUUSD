@@ -31,6 +31,7 @@ class DeltaPublicWebSocket:
                     self.settings.public_ws_url, ping_interval=20, ping_timeout=20
                 ) as socket:
                     delay = self.settings.reconnect_initial_seconds
+                    await socket.send(json.dumps({"type": "enable_heartbeat"}))
                     if self._subscriptions:
                         await socket.send(json.dumps(self.subscribe_message(self._subscriptions)))
                     async for raw in socket:
@@ -76,6 +77,7 @@ class DeltaPrivateWebSocket:
                     self.settings.private_ws_url, ping_interval=20, ping_timeout=20
                 ) as socket:
                     delay = self.settings.reconnect_initial_seconds
+                    await socket.send(json.dumps({"type": "enable_heartbeat"}))
                     await socket.send(json.dumps(self.authentication_message()))
                     authenticated = False
                     async for raw in socket:

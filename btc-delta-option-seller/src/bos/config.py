@@ -146,6 +146,20 @@ class PaperSettings(BaseModel):
     reject_stale_after_seconds: float = Field(default=5, gt=0)
 
 
+class ExecutionSettings(BaseModel):
+    reprice_fraction: float = Field(default=0.25, gt=0, le=1)
+    maximum_reprices: int = Field(default=4, ge=0, le=10)
+    maximum_slippage_bps: float = Field(default=25, ge=0)
+    maximum_entry_seconds: float = Field(default=30, gt=0)
+
+
+class HeartbeatSettings(BaseModel):
+    ttl_ms: int = Field(default=30_000, ge=5_000)
+    acknowledgment_interval_seconds: float = Field(default=10, gt=0)
+    unhealthy_after_seconds: float = Field(default=35, gt=0)
+    heartbeat_id: str = Field(default="bos1-india", min_length=1, max_length=32)
+
+
 class LiveSettings(BaseModel):
     live_trading: bool = False
 
@@ -172,6 +186,8 @@ class Settings(BaseSettings):
     backtest: BacktestSettings = Field(default_factory=BacktestSettings)
     research: ResearchSettings = Field(default_factory=ResearchSettings)
     paper: PaperSettings = Field(default_factory=PaperSettings)
+    execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
+    heartbeat: HeartbeatSettings = Field(default_factory=HeartbeatSettings)
     live: LiveSettings = Field(default_factory=LiveSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     armed: bool = False

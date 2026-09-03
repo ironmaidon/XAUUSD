@@ -56,16 +56,92 @@ class DeltaOptionChainService:
 
 
 class DeltaOrderService:
-    """M1 boundary: no order-submission methods exist until execution safety is implemented."""
+    def __init__(self, client: DeltaRestClient) -> None:
+        self.client = client
+
+    async def open_orders(self) -> list[dict[str, object]]:
+        result = await self.client.request(
+            "GET", "/v2/orders", list[dict[str, object]], authenticated=True
+        )
+        return cast(list[dict[str, object]], result)
+
+    async def recent_fills(self) -> list[dict[str, object]]:
+        result = await self.client.request(
+            "GET", "/v2/fills", list[dict[str, object]], authenticated=True
+        )
+        return cast(list[dict[str, object]], result)
+
+    async def cancel(self, product_id: int, client_order_id: str) -> dict[str, object]:
+        result = await self.client.request(
+            "DELETE",
+            "/v2/orders",
+            dict[str, object],
+            json_body={"product_id": product_id, "client_order_id": client_order_id},
+            authenticated=True,
+        )
+        return cast(dict[str, object], result)
 
 
 class DeltaPositionService:
-    pass
+    def __init__(self, client: DeltaRestClient) -> None:
+        self.client = client
+
+    async def list(self, underlying_asset_symbol: str = "BTC") -> list[dict[str, object]]:
+        result = await self.client.request(
+            "GET",
+            "/v2/positions",
+            list[dict[str, object]],
+            params={"underlying_asset_symbol": underlying_asset_symbol},
+            authenticated=True,
+        )
+        return cast(list[dict[str, object]], result)
 
 
 class DeltaWalletService:
-    pass
+    def __init__(self, client: DeltaRestClient) -> None:
+        self.client = client
+
+    async def balances(self) -> list[dict[str, object]]:
+        result = await self.client.request(
+            "GET", "/v2/wallet/balances", list[dict[str, object]], authenticated=True
+        )
+        return cast(list[dict[str, object]], result)
 
 
 class DeltaHeartbeatService:
-    pass
+    def __init__(self, client: DeltaRestClient) -> None:
+        self.client = client
+
+    async def create(self, heartbeat_id: str) -> dict[str, object]:
+        result = await self.client.request(
+            "POST",
+            "/v2/heartbeat/create",
+            dict[str, object],
+            json_body={
+                "heartbeat_id": heartbeat_id,
+                "impact": "all_subaccounts",
+                "config": [{"action": "cancel_orders", "unhealthy_count": 1, "tag": "bos1"}],
+            },
+            authenticated=True,
+        )
+        return cast(dict[str, object], result)
+
+    async def acknowledge(self, heartbeat_id: str, ttl_ms: int) -> dict[str, object]:
+        result = await self.client.request(
+            "POST",
+            "/v2/heartbeat",
+            dict[str, object],
+            json_body={"heartbeat_id": heartbeat_id, "ttl": ttl_ms},
+            authenticated=True,
+        )
+        return cast(dict[str, object], result)
+
+    async def list(self, user_id: int) -> list[dict[str, object]]:
+        result = await self.client.request(
+            "GET",
+            "/v2/heartbeat",
+            list[dict[str, object]],
+            params={"user_id": user_id},
+            authenticated=True,
+        )
+        return cast(list[dict[str, object]], result)

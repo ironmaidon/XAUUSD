@@ -75,6 +75,16 @@ paper:
   slippage_bps: 5
   max_book_participation: 0.20
   reject_stale_after_seconds: 5
+execution:
+  reprice_fraction: 0.25
+  maximum_reprices: 4
+  maximum_slippage_bps: 25
+  maximum_entry_seconds: 30
+heartbeat:
+  ttl_ms: 30000
+  acknowledgment_interval_seconds: 10
+  unhealthy_after_seconds: 35
+  heartbeat_id: bos1-india
 live:
   live_trading: false
 logging:
