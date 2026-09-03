@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime
+from pathlib import Path
 
 from bos.config import Mode, Settings
 from bos.dashboard.models import DashboardSnapshot, SystemStatusView
@@ -14,12 +16,17 @@ class DashboardState:
         self._lock = asyncio.Lock()
         self._version = 0
         self._changed = asyncio.Condition()
+        report_path = Path(__file__).resolve().parents[3] / "reports" / "backtest-one-year.json"
+        backtests = []
+        if report_path.is_file():
+            backtests = [json.loads(report_path.read_text(encoding="utf-8"))]
         self._snapshot = DashboardSnapshot(
             status=SystemStatusView(
                 mode=settings.mode.value,
                 armed=False,
                 updated_at=datetime.now(UTC),
-            )
+            ),
+            backtests=backtests,
         )
 
     async def get(self) -> tuple[int, DashboardSnapshot]:

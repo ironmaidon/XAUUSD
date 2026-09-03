@@ -1,0 +1,28 @@
+{
+  "period_start": "2025-09-03T08:03:35+00:00",
+  "period_end": "2026-09-03T08:03:35+00:00",
+  "candle_count": 2190,
+  "data_quality": "ESTIMATED_OPTIONS_REAL_UNDERLYING",
+  "initial_equity": 1000000,
+  "ending_equity": 990005.346853117,
+  "net_pnl": -9994.653146883007,
+  "return_pct": -0.999465314688297,
+  "trades": 9,
+  "win_rate_pct": 22.22222222222222,
+  "average_trade": -1110.5170163203327,
+  "maximum_drawdown_pct": 0.9994653146883007,
+  "exit_reasons": {
+    "DELTA_STOP": 2,
+    "MISSING_QUOTE": 2,
+    "PREMIUM_STOP": 3,
+    "PROFIT_TARGET": 2
+  },
+  "rejected_entries": 3309,
+  "fees": {
+    "slippage_bps": 5,
+    "option_fee_rate": 0.0003,
+    "gst_rate": 0.18,
+    "settlement_fee_rate": 0,
+    "partial_fill_ratio": 1.0
+  }
+}
