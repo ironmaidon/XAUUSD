@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 from bos.config import ExchangeSettings, Settings
@@ -31,6 +31,15 @@ from bos.strategy.structures import (
     validate_market,
 )
 from bos.strategy.volatility import expected_move, realized_volatility, vrp_ratio
+from bos.strategy.zero_dte import (
+    StrangleSelection,
+    entry_window,
+    forced_exit_due,
+    local_date,
+    notional_capped_quantity,
+    premium_stop_due,
+    select_lowest_available_delta,
+)
 
 
 class PaperTradingRuntime:
@@ -44,6 +53,11 @@ class PaperTradingRuntime:
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
         self._entered = False
+        self._trade_date: date | None = None
+        self._strangle: StrangleSelection | None = None
+        self._entry_credit = 0.0
+        self._quantity = 0.0
+        self._exit_submitted = False
 
     @property
     def running(self) -> bool:
@@ -99,10 +113,160 @@ class PaperTradingRuntime:
 
         markets, chain_iv, target_expiry, dte = self._markets(chain, spot, now)
         equity, available = self._account(wallet)
-        snapshot = await self._evaluate(
+        snapshot = await self._evaluate_zero_dte(
             spot, candles, markets, chain_iv, target_expiry, dte, equity, available, now
         )
         await self.dashboard.publish(snapshot)
+
+    async def _evaluate_zero_dte(
+        self,
+        spot: float,
+        candles: list[Candle],
+        markets: list[OptionMarket],
+        chain_iv: float | None,
+        target_expiry: datetime | None,
+        dte: float,
+        equity: float,
+        available: float,
+        now: datetime,
+    ) -> DashboardSnapshot:
+        _, snapshot = await self.dashboard.get()
+        today = local_date(now)
+        if self._trade_date != today:
+            self._trade_date = today
+            self._strangle = None
+            self._entry_credit = 0
+            self._quantity = 0
+            self._exit_submitted = False
+        for market in markets:
+            self.paper.on_quote(market, now)
+
+        reasons: list[str] = []
+        selection: StrangleSelection | None = None
+        try:
+            selection = select_lowest_available_delta(markets)
+        except ValueError as error:
+            reasons.append(str(error))
+
+        entry_due = entry_window(now, self._strangle is not None)
+        if entry_due and selection:
+            quantity = notional_capped_quantity(equity, spot)
+            if quantity > 0 and selection.entry_credit > 0:
+                self._strangle = selection
+                self._entry_credit = selection.entry_credit
+                self._quantity = quantity
+                for index, market in enumerate((selection.call, selection.put)):
+                    self.paper.submit(
+                        OrderRequest(
+                            f"0dte-{today:%Y%m%d}-entry-{index}",
+                            market.product_id,
+                            market.symbol,
+                            Side.SELL,
+                            quantity,
+                            market.bid,
+                        ),
+                        now,
+                    )
+                reasons.append("PAPER_STRANGLE_ENTRY_SUBMITTED")
+            else:
+                reasons.append("NOTIONAL_OR_PREMIUM_GATE")
+        elif self._strangle and not self._exit_submitted:
+            by_symbol = {market.symbol: market for market in markets}
+            call = by_symbol.get(self._strangle.call.symbol)
+            put = by_symbol.get(self._strangle.put.symbol)
+            stop = bool(call and put and premium_stop_due(self._entry_credit, call.ask, put.ask))
+            timed = forced_exit_due(now)
+            if stop or timed:
+                reason = "PREMIUM_STOP" if stop else "TIME_EXIT_1630_IST"
+                if call and put:
+                    for index, market in enumerate((call, put)):
+                        self.paper.submit(
+                            OrderRequest(
+                                f"0dte-{today:%Y%m%d}-exit-{index}",
+                                market.product_id,
+                                market.symbol,
+                                Side.BUY,
+                                self._quantity,
+                                market.ask,
+                                reduce_only=True,
+                            ),
+                            now,
+                        )
+                    self._exit_submitted = True
+                    reasons.append(reason)
+                else:
+                    reasons.append("EXIT_QUOTE_MISSING")
+            else:
+                reasons.append("MONITORING_OPEN_STRANGLE")
+        else:
+            reasons.append("WAITING_FOR_0800_IST" if not self._strangle else "EXIT_SUBMITTED")
+
+        closes = [float(c.close) for c in candles]
+        rv = realized_volatility(closes, self.settings.volatility.rv_window, 6 * 365)
+        move = expected_move(spot, chain_iv, dte) if chain_iv else None
+        shown = self._strangle or selection
+        score_components = {
+            "call_delta": abs(shown.call.delta) * 100 if shown else 0,
+            "put_delta": abs(shown.put.delta) * 100 if shown else 0,
+            "gross_notional_cap_x": 10,
+        }
+        snapshot.status.btc_price = spot
+        snapshot.status.connection = "CONNECTED"
+        snapshot.status.paper_trading_active = True
+        snapshot.status.regime = "0DTE_STRANGLE"
+        snapshot.status.entry_score = 0
+        snapshot.status.target_expiry = target_expiry
+        snapshot.status.dte = dte
+        snapshot.status.heartbeat_healthy = True
+        snapshot.status.volatility = VolatilityView(
+            atm_iv=chain_iv,
+            rv20=rv,
+            vrp=vrp_ratio(chain_iv, rv) if chain_iv else None,
+            expected_move_usd=move.usd if move else None,
+        )
+        snapshot.candles = [
+            {
+                "time": c.time,
+                "open": float(c.open),
+                "high": float(c.high),
+                "low": float(c.low),
+                "close": float(c.close),
+            }
+            for c in candles[-120:]
+        ]
+        snapshot.option_chain = [self._market_view(market) for market in markets]
+        snapshot.candidate = CandidateView(
+            structure="SHORT_STRANGLE_0DTE" if shown else None,
+            strikes=[shown.put.strike, shown.call.strike] if shown else [],
+            deltas=[shown.put.delta, shown.call.delta] if shown else [],
+            net_credit=self._entry_credit or (shown.entry_credit if shown else None),
+            quantity=self._quantity or None,
+            eligible=entry_due and shown is not None,
+            reasons=reasons,
+            score_components=score_components,
+        )
+        snapshot.risk = RiskView(
+            account_equity_inr=equity,
+            available_funds_inr=available,
+            margin_usage_pct=(
+                min(100, 2 * spot * 0.001 * self._quantity / equity * 100)
+                if equity and self._quantity
+                else 0
+            ),
+            kill_switches=[],
+        )
+        snapshot.orders = [self._order_view(order) for order in self.paper.orders.values()]
+        snapshot.fills = [asdict(fill) for fill in self.paper.fills]
+        snapshot.positions = self._positions()
+        snapshot.logs = [
+            {
+                "time": now.isoformat(),
+                "level": "INFO",
+                "event": "ZERO_DTE_EVALUATION",
+                "reason": " · ".join(reasons),
+            }
+        ]
+        return snapshot
 
     async def _evaluate(
         self,
@@ -262,11 +426,15 @@ class PaperTradingRuntime:
             {
                 quote.product.settlement_time
                 for quote in quotes
-                if quote.product.settlement_time and quote.product.settlement_time > now
+                if quote.product.settlement_time
+                and quote.product.settlement_time > now
+                and local_date(quote.product.settlement_time) == local_date(now)
             },
-            key=lambda value: abs((value - now).total_seconds() / 86400 - 14),
+            key=lambda value: value,
         )
         target_expiry = valid_expiries[0] if valid_expiries else None
+        if target_expiry is None:
+            return [], None, None, 0.01
         output = []
         iv_candidates: list[tuple[float, float]] = []
         for quote in quotes:
