@@ -11,7 +11,7 @@ IST = timezone(timedelta(hours=5, minutes=30), name="IST")
 
 @dataclass(frozen=True)
 class ZeroDteSettings:
-    entry_time: time = time(8, 0)
+    entry_time: time = time(9, 20)
     exit_time: time = time(16, 30)
     premium_stop_multiple: float = 2.0
     gross_notional_multiple: float = 10.0
@@ -39,7 +39,7 @@ def local_date(value: datetime) -> date:
 
 def entry_window(value: datetime, already_entered: bool) -> bool:
     local = value.astimezone(IST)
-    return not already_entered and time(8, 0) <= local.time() < time(8, 1)
+    return not already_entered and time(9, 20) <= local.time() < time(9, 21)
 
 
 def forced_exit_due(value: datetime) -> bool:

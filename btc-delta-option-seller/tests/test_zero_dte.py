@@ -29,8 +29,8 @@ def test_selects_lowest_listed_delta_on_each_side() -> None:
 
 
 def test_ist_schedule() -> None:
-    assert entry_window(datetime(2026, 9, 3, 2, 30, 30, tzinfo=UTC), False)
-    assert not entry_window(datetime(2026, 9, 3, 2, 31, tzinfo=UTC), False)
+    assert entry_window(datetime(2026, 9, 3, 3, 50, 30, tzinfo=UTC), False)
+    assert not entry_window(datetime(2026, 9, 3, 3, 51, tzinfo=UTC), False)
     assert forced_exit_due(datetime(2026, 9, 3, 11, 0, tzinfo=UTC))
 
 
