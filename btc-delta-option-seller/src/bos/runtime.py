@@ -199,7 +199,7 @@ class PaperTradingRuntime:
             else:
                 reasons.append("MONITORING_OPEN_STRANGLE")
         else:
-            reasons.append("WAITING_FOR_0920_IST" if not self._strangle else "EXIT_SUBMITTED")
+            reasons.append("WAITING_FOR_1005_IST" if not self._strangle else "EXIT_SUBMITTED")
 
         closes = [float(c.close) for c in candles]
         rv = realized_volatility(closes, self.settings.volatility.rv_window, 6 * 365)
