@@ -1,4 +1,5 @@
 from datetime import date
+from decimal import Decimal
 from unittest.mock import AsyncMock
 
 import pytest
@@ -38,6 +39,25 @@ async def test_option_chain_keeps_only_btc_options() -> None:
         underlying_asset_symbols="BTC",
         expiry_date="10-09-2026",
     )
+
+
+def test_ticker_flattens_delta_nested_quotes() -> None:
+    ticker = Ticker.model_validate(
+        {
+            "symbol": "C-BTC-100000-100926",
+            "quotes": {
+                "best_bid": "120",
+                "best_ask": "125",
+                "bid_size": "30",
+                "ask_size": "40",
+            },
+        }
+    )
+
+    assert ticker.best_bid == Decimal("120")
+    assert ticker.best_ask == Decimal("125")
+    assert ticker.bid_size == Decimal("30")
+    assert ticker.ask_size == Decimal("40")
 
 
 @pytest.mark.asyncio

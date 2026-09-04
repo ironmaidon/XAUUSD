@@ -440,7 +440,6 @@ class PaperTradingRuntime:
         for quote in quotes:
             if target_expiry and quote.product.settlement_time != target_expiry:
                 continue
-            raw = quote.ticker.model_dump()
             option = OptionType.CALL if "call" in quote.product.contract_type else OptionType.PUT
             if (
                 quote.product.strike_price is None
@@ -458,8 +457,8 @@ class PaperTradingRuntime:
                     float(quote.product.strike_price),
                     float(quote.ticker.best_bid),
                     float(quote.ticker.best_ask),
-                    float(raw.get("bid_size") or 100),
-                    float(raw.get("ask_size") or 100),
+                    float(quote.ticker.bid_size or 100),
+                    float(quote.ticker.ask_size or 100),
                     float(quote.ticker.greeks.delta),
                     float(quote.ticker.greeks.gamma or 0),
                     float(quote.ticker.greeks.theta or 0),

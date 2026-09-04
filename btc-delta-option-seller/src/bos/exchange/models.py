@@ -4,7 +4,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Generic, TypeVar
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 T = TypeVar("T")
 
@@ -61,9 +61,25 @@ class Ticker(BaseModel):
     spot_price: Decimal | None = None
     best_bid: Decimal | None = None
     best_ask: Decimal | None = None
+    bid_size: Decimal | None = None
+    ask_size: Decimal | None = None
     mark_vol: Decimal | None = None
     greeks: Greeks | None = None
     timestamp: int | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def flatten_quotes(cls, value: Any) -> Any:
+        """Support Delta's current ticker payload with prices nested under quotes."""
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        quotes = normalized.get("quotes")
+        if isinstance(quotes, dict):
+            for field in ("best_bid", "best_ask", "bid_size", "ask_size"):
+                if normalized.get(field) is None and quotes.get(field) is not None:
+                    normalized[field] = quotes[field]
+        return normalized
 
     @field_validator("product_id", mode="before")
     @classmethod
